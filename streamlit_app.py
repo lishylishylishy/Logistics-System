@@ -16,7 +16,7 @@ def detect_supplier(uploaded_file) -> str:
         
         # 供应商特征映射表（仅做身份识别）
         signatures = {
-            "4PX": ["联邮通", "价格表目录"],
+            "4PX": ["递四方","4PX"],
             "YunExpress": ["云途", "YunExpress"],
             "SF": ["顺丰", "SFExpress"]
         }
