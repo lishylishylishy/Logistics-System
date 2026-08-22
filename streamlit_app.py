@@ -1,89 +1,96 @@
+import os
 import streamlit as st
 import pandas as pd
 from openpyxl import load_workbook
-import yaml
 
-st.set_page_config(
-    page_title="物流报价解析系统",
-    page_icon="📦",
-    layout="wide"
-)
+st.set_page_config(page_title="物流报价解析系统", layout="wide")
 
-# 自定义微调 CSS：控制标题字号与间距
-st.markdown("""
-    <style>
-    .main .block-container { padding-top: 2rem; padding-bottom: 2rem; }
-    h1 { font-size: 1.8rem !important; font-weight: 600; }
-    h2 { font-size: 1.3rem !important; }
-    </style>
-""", unsafe_allow_html=True)
+# -----------------------------------------------------------------------------
+# 1. 核心控制逻辑：供应商识别与规则路由
+# -----------------------------------------------------------------------------
+def detect_supplier(uploaded_file) -> str:
+    """第一步：根据 Excel Sheet 名称判断属于哪个供应商"""
+    try:
+        wb = load_workbook(uploaded_file, read_only=True, data_only=True)
+        sheet_names = wb.sheetnames
+        
+        # 供应商特征映射表（仅做身份识别）
+        signatures = {
+            "4PX": ["联邮通", "价格表目录"],
+            "YunExpress": ["云途", "YunExpress"],
+            "SF": ["顺丰", "SFExpress"]
+        }
+        
+        for supplier, keywords in signatures.items():
+            for sheet in sheet_names:
+                if any(kw in sheet for kw in keywords):
+                    return supplier
+        return "Unknown"
+    except Exception as e:
+        st.error(f"文件读取失败: {e}")
+        return "Unknown"
 
-# --- 侧边栏：文件上传与控制中心 ---
+def get_mapping_rule_path(supplier: str):
+    """第二步：根据供应商名称，自动路由到对应的映射配置文件"""
+    if supplier == "Unknown":
+        return None, False
+    
+    # 约定好的规则文件存储路径，例如：mappings/4px/mapping.yaml
+    rule_path = f"mappings/{supplier.lower()}/mapping.yaml"
+    has_rule = os.path.exists(rule_path)
+    return rule_path, has_rule
+
+# -----------------------------------------------------------------------------
+# 2. UI 界面布局
+# -----------------------------------------------------------------------------
+st.title("📦 物流报价单自动路由与解析系统")
+
+# 侧边栏：文件上传与识别状态
 with st.sidebar:
-    st.title("📦 物流报价解析系统")
-    st.caption("自动化报价表解析与数据库同步")
-    st.divider()
+    st.header("文件控制台")
+    uploaded_file = st.file_uploader("请上传报价单 (Excel)", type=["xlsx", "xls"])
     
-    uploaded_file = st.file_uploader(
-        "上传报价单 Excel",
-        type=["xlsx", "xls"],
-        help="支持 4PX、云途等通用物流报价表"
-    )
-    
-    supplier = None
-    if uploaded_file is not None:
-        try:
-            wb = load_workbook(uploaded_file, read_only=True, data_only=True)
-            sheet_names = wb.sheetnames
-            
-            # 识别供应商逻辑
-            if any("联邮通" in name for name in sheet_names) or any("价格表目录" in name for name in sheet_names):
-                supplier = "4PX"
-            
-            if supplier:
-                st.success(f"识别供应商: **{supplier}**")
-            else:
-                st.error("无法自动识别供应商")
-        except Exception as e:
-            st.error(f"读取文件失败: {e}")
+    supplier = "Unknown"
+    rule_path = None
+    has_rule = False
 
-    st.divider()
-    parse_btn = st.button("🚀 开始自动化解析", type="primary", use_container_width=True, disabled=(not supplier))
-
-# --- 主界面：解析结果与查看 ---
-st.title("报价数据看板")
-
-if not uploaded_file:
-    st.info("👈 请在左侧侧边栏拖入 Excel 报价表开始操作。")
-else:
-    # 顶部指标卡片
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Sheet 总数", len(sheet_names))
-    col2.metric("识别结果", supplier if supplier else "未知")
-    col3.metric("解析状态", "待解析" if not parse_btn else "处理完成")
-    col4.metric("异常排查项", "0 项" if not parse_btn else "需人工确认 2 项")
-
-    # 分页展示区
-    tab1, tab2, tab3 = st.tabs(["📊 标准化价格表", "⚠️ 异常/政策提示 (AI)", "📋 原始 Sheet 预览"])
-    
-    with tab1:
-        if parse_btn:
-            st.subheader("标准化结构数据预览")
-            # 占位演示数据，后续对接 parser.py
-            sample_df = pd.DataFrame([
-                {"carrier": supplier, "country": "英国", "product_code": "ZQ", "weight_range": "0-2kg", "freight_price": 100, "registration_fee": 21, "tax_included": "NO"},
-                {"carrier": supplier, "country": "法国", "product_code": "ZQ", "weight_range": "0-2kg", "freight_price": 105, "registration_fee": 22, "tax_included": "NO"},
-            ])
-            st.dataframe(sample_df, use_container_width=True)
-            st.button("⬆️ 确认同步至 Google Sheets")
+    if uploaded_file:
+        supplier = detect_supplier(uploaded_file)
+        rule_path, has_rule = get_mapping_rule_path(supplier)
+        
+        st.divider()
+        st.markdown(f"**识别供应商:** `{supplier}`")
+        st.markdown(f"**路由配置文件:** `{rule_path}`")
+        
+        if has_rule:
+            st.success("✅ 找到匹配的映射规则！")
         else:
-            st.caption("点击左侧侧边栏【开始自动化解析】按钮查看解析提取结果。")
-            
-    with tab2:
-        st.subheader("AI 提取的附加费与税费政策")
-        st.write("- **超尺寸附加费**: 最长边 > 60cm 需加收 130 RMB/票")
-        st.write("- **VAT 增值税**: 未含税，按目的地国家实际税率核算")
+            st.warning("⚠️ 暂未找到该供应商的映射规则文件。")
 
-    with tab3:
-        st.subheader("原始 Sheet 清单")
-        st.dataframe(pd.DataFrame({"Sheet 名称": sheet_names}), height=300, use_container_width=True)
+    parse_btn = st.button("开始运行解析", type="primary", disabled=(not has_rule))
+
+# 主界面：内容展示
+if not uploaded_file:
+    st.info("👈 请在左侧侧边栏上传 Excel 报价单。")
+else:
+    tab1, tab2 = st.tabs(["📋 原始 Sheet 预览", "🚀 解析结果预测"])
+
+    with tab1:
+        st.subheader("Excel 包含的 Sheet 清单")
+        excel_data = pd.ExcelFile(uploaded_file)
+        st.write("所有 Sheet 名称：", excel_data.sheet_names)
+        
+        selected_sheet = st.selectbox("选择预览 Sheet", excel_data.sheet_names)
+        if selected_sheet:
+            df_preview = pd.read_excel(uploaded_file, sheet_name=selected_sheet, nrows=10)
+            st.dataframe(df_preview, use_container_width=True)
+
+    with tab2:
+        if parse_btn:
+            st.subheader(f"使用 [{rule_path}] 运行解析中...")
+            # TODO: 此处后续只需一行代码调用你的通用解析器：
+            # parsed_df = run_parser(uploaded_file, rule_path)
+            # st.dataframe(parsed_df)
+            st.info("路由运行成功！请在此处接入具体 parser 的返回数据。")
+        else:
+            st.caption("请点击侧边栏的【开始运行解析】执行路由。")
