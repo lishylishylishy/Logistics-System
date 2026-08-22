@@ -33,33 +33,23 @@ def detect_supplier(uploaded_file) -> str:
         st.error(f"文件名读取失败: {e}")
         return "Unknown"
 
+ # ==================== 放置位置：到这里结束 ===================="1GjrPj2bKQZFz_ls5Y6ViI2fL_ovWcayN6ri58tiJErU"
 @st.cache_data(ttl=300)
 def fetch_rules_from_gsheet(supplier: str):
-    """从 Streamlit Cloud Secrets 加载凭证，调用 API 读取对应的 Tab 页规则"""
     if supplier == "Unknown":
         return None, False
         
     try:
-        # ==================== Google Sheet API：从这里开始 ====================
-        # 1. 从 Secrets 提取凭证字典
+        # 1. 读取 Secrets 并修复换行符
         creds = dict(st.secrets["gcp_service_account"])
+        creds["private_key"] = creds["private_key"].replace("\\n", "\n")
 
-        # 2. 自动把变形的 \n 修复为真正的换行
-        if "private_key" in creds:
-            creds["private_key"] = creds["private_key"].replace("\\n", "\n")
-
-        # 3. 使用修复好的凭证初始化 API 客户端
+        # 2. 调用 API 读取表格
         gc = gspread.service_account_from_dict(creds)
-        # ==================== 放置位置：到这里结束 ====================
-        
-        # 4. 打开 Google Sheet 文档并定位到对应的 Tab 页
         sh = gc.open_by_key("1GjrPj2bKQZFz_ls5Y6ViI2fL_ovWcayN6ri58tiJErU")
         worksheet = sh.worksheet(supplier)
         
-        # 5. 获取所有数据转为 DataFrame
-        records = worksheet.get_all_records()
-        rules_df = pd.DataFrame(records)
-        return rules_df, True
+        return pd.DataFrame(worksheet.get_all_records()), True
         
     except gspread.exceptions.WorksheetNotFound:
         st.sidebar.error(f"❌ Google Sheet 中未找到名为 [{supplier}] 的 Tab 页！")
