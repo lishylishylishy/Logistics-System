@@ -1,3 +1,4 @@
+import json
 import streamlit as st
 import pandas as pd
 import gspread
@@ -6,9 +7,9 @@ from openpyxl import load_workbook
 st.set_page_config(page_title="物流报价解析系统", layout="wide")
 
 # -----------------------------------------------------------------------------
-# 0. 配置 Google Sheet ID (替换为你的网页 URL 里面 /d/ 和 /edit 之间的字符)
+# 0. 配置 Google Sheet ID
 # -----------------------------------------------------------------------------
-SPREADSHEET_ID = "你的_GOOGLE_SHEET_ID"
+SPREADSHEET_ID = "1GjrPj2bKQZFz_ls5Y6ViI2fL_ovWcayN6ri58tiJErU"
 
 # -----------------------------------------------------------------------------
 # 1. 核心控制逻辑：供应商识别与 Google Sheet 云端规则调取
@@ -33,20 +34,18 @@ def detect_supplier(uploaded_file) -> str:
         st.error(f"文件名读取失败: {e}")
         return "Unknown"
 
- # ==================== 放置位置：到这里结束 ===================="1GjrPj2bKQZFz_ls5Y6ViI2fL_ovWcayN6ri58tiJErU"
 @st.cache_data(ttl=300)
 def fetch_rules_from_gsheet(supplier: str):
     if supplier == "Unknown":
         return None, False
         
     try:
-        # 1. 读取 Secrets 并修复换行符
-        creds = dict(st.secrets["gcp_service_account"])
-        creds["private_key"] = creds["private_key"].replace("\\n", "\n")
+        # 直接解析整段 JSON 字符串（自动处理内部 \n 换行）
+        creds = json.loads(st.secrets["gcp_json"])
 
-        # 2. 调用 API 读取表格
+        # 调用 API 读取表格
         gc = gspread.service_account_from_dict(creds)
-        sh = gc.open_by_key("1GjrPj2bKQZFz_ls5Y6ViI2fL_ovWcayN6ri58tiJErU")
+        sh = gc.open_by_key(SPREADSHEET_ID)
         worksheet = sh.worksheet(supplier)
         
         return pd.DataFrame(worksheet.get_all_records()), True
@@ -74,7 +73,6 @@ with st.sidebar:
 
     if uploaded_file:
         supplier = detect_supplier(uploaded_file)
-        # 调用 API 拿到的不是文件路径，而是直接包含规则数据的 DataFrame
         rules_df, has_rule = fetch_rules_from_gsheet(supplier)
         
         st.divider()
@@ -114,9 +112,6 @@ else:
     with tab3:
         if parse_btn:
             st.subheader(f"使用云端 [{supplier}] 映射规则解析中...")
-            # TODO: 此处后续直接把文件和 rules_df 传给具体的 parser：
-            # parsed_df = run_parser(uploaded_file, rules_df)
-            # st.dataframe(parsed_df)
             st.info("路由运行成功！已就绪 API 返回的规则数据，请在此处接入解析代码。")
         else:
             st.caption("请点击侧边栏的【开始运行解析】执行路由。")
