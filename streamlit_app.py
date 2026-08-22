@@ -10,7 +10,7 @@ from openai import OpenAI
 # 【配置区 A】核心接口与数据库配置 (请填入你的真实信息)
 # =============================================================================
 # 1. 阿里云百炼 API 配置
-API_KEY = st.secrets.get("API_KEY", "sk-f37d8d4817b24bddbdb5982336b7a5a5")
+API_KEY = st.secrets.get("API_KEY")
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 MODEL_NAME = "qwen3.8-27b"
 
