@@ -40,8 +40,8 @@ def fetch_rules_from_gsheet(supplier: str):
         return None, False
         
     try:
-        # 直接解析整段 JSON 字符串（自动处理内部 \n 换行）
-        creds = json.loads(st.secrets["gcp_json"])
+        # 加入 strict=False 容忍 JSON 字符串内的控制字符与换行
+        creds = json.loads(st.secrets["gcp_json"], strict=False)
 
         # 调用 API 读取表格
         gc = gspread.service_account_from_dict(creds)
