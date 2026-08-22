@@ -1,5 +1,7 @@
+google-genai
 streamlit
 pandas
 gspread
 openpyxl
-google-genai
+openai
+oauth2client
