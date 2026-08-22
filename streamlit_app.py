@@ -9,25 +9,24 @@ st.set_page_config(page_title="物流报价解析系统", layout="wide")
 # 1. 核心控制逻辑：供应商识别与规则路由
 # -----------------------------------------------------------------------------
 def detect_supplier(uploaded_file) -> str:
-    """第一步：根据 Excel Sheet 名称判断属于哪个供应商"""
+    """仅根据上传文件名判断属于哪个供应商"""
     try:
-        wb = load_workbook(uploaded_file, read_only=True, data_only=True)
-        sheet_names = wb.sheetnames
+        filename = uploaded_file.name.lower()
         
-        # 供应商特征映射表（仅做身份识别）
+        # 供应商文件名关键词映射表
         signatures = {
-            "4PX": ["递四方","4PX"],
-            "YunExpress": ["云途", "YunExpress"],
-            "SF": ["顺丰", "SFExpress"]
+            "4PX": ["递四方", "4px"],
+            "YunExpress": ["云途", "yunexpress"],
+            "SF": ["顺丰", "sfexpress", "sf"]
         }
         
         for supplier, keywords in signatures.items():
-            for sheet in sheet_names:
-                if any(kw in sheet for kw in keywords):
-                    return supplier
+            if any(kw in filename for kw in keywords):
+                return supplier
+                
         return "Unknown"
     except Exception as e:
-        st.error(f"文件读取失败: {e}")
+        st.error(f"文件名读取失败: {e}")
         return "Unknown"
 
 def get_mapping_rule_path(supplier: str):
