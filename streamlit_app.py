@@ -40,19 +40,30 @@ def fetch_rules_from_gsheet(supplier: str):
         return None, False
         
     try:
-        # 加入 strict=False 容忍 JSON 字符串内的控制字符与换行
         creds = json.loads(st.secrets["gcp_json"], strict=False)
-
-        # 调用 API 读取表格
         gc = gspread.service_account_from_dict(creds)
         sh = gc.open_by_key(SPREADSHEET_ID)
-        worksheet = sh.worksheet(supplier)
+
+        # ---------------------------------------------------------
+        # 宽容匹配逻辑：忽略大小写、去空格、包含即可
+        # ---------------------------------------------------------
+        all_worksheets = sh.worksheets()
+        target_ws = None
         
-        return pd.DataFrame(worksheet.get_all_records()), True
+        search_key = supplier.strip().lower()
+        for ws in all_worksheets:
+            sheet_title = ws.title.strip().lower()
+            # 只要包含关键字（例如 "4px" 匹配 "4PX-规则" 或 "4px"）
+            if search_key in sheet_title:
+                target_ws = ws
+                break
         
-    except gspread.exceptions.WorksheetNotFound:
-        st.sidebar.error(f"❌ Google Sheet 中未找到名为 [{supplier}] 的 Tab 页！")
-        return None, False
+        if not target_ws:
+            st.sidebar.error(f"❌ Google Sheet 中未找到包含关键词 [{supplier}] 的 Tab 页！")
+            return None, False
+
+        return pd.DataFrame(target_ws.get_all_records()), True
+        
     except Exception as e:
         st.sidebar.error(f"❌ 读取云端规则 API 异常: {e}")
         return None, False
