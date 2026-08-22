@@ -1,23 +1,27 @@
-import os
 import streamlit as st
 import pandas as pd
+import gspread
 from openpyxl import load_workbook
 
 st.set_page_config(page_title="物流报价解析系统", layout="wide")
 
 # -----------------------------------------------------------------------------
-# 1. 核心控制逻辑：供应商识别与规则路由
+# 0. 配置 Google Sheet ID (替换为你的网页 URL 里面 /d/ 和 /edit 之间的字符)
+# -----------------------------------------------------------------------------
+SPREADSHEET_ID = "你的_GOOGLE_SHEET_ID"
+
+# -----------------------------------------------------------------------------
+# 1. 核心控制逻辑：供应商识别与 Google Sheet 云端规则调取
 # -----------------------------------------------------------------------------
 def detect_supplier(uploaded_file) -> str:
     """仅根据上传文件名判断属于哪个供应商"""
     try:
         filename = uploaded_file.name.lower()
         
-        # 供应商文件名关键词映射表
         signatures = {
             "4PX": ["递四方", "4px"],
             "YunExpress": ["云途", "yunexpress"],
-            "SF": ["顺丰", "sfexpress", "sf"]
+            "SF": ["顺丰", "sf"]
         }
         
         for supplier, keywords in signatures.items():
@@ -29,15 +33,32 @@ def detect_supplier(uploaded_file) -> str:
         st.error(f"文件名读取失败: {e}")
         return "Unknown"
 
-def get_mapping_rule_path(supplier: str):
-    """第二步：根据供应商名称，自动路由到对应的映射配置文件"""
+@st.cache_data(ttl=300)  # 开启 5 分钟缓存，避免频繁刷页面触发 API 频控
+def fetch_rules_from_gsheet(supplier: str):
+    """从 Streamlit Cloud Secrets 加载凭证，调用 API 读取对应的 Tab 页规则"""
     if supplier == "Unknown":
         return None, False
-    
-    # 约定好的规则文件存储路径，例如：mappings/4px/mapping.yaml
-    rule_path = f"mappings/{supplier.lower()}/mapping.yaml"
-    has_rule = os.path.exists(rule_path)
-    return rule_path, has_rule
+        
+    try:
+        # 1. 从云端 Secrets 中读取凭证并初始化 API
+        creds = dict(st.secrets["gcp_service_account"])
+        gc = gspread.service_account_from_dict(creds)
+        
+        # 2. 打开 Google Sheet 文档并定位到供应商名称同名的 Tab 页 (如 "4PX")
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        worksheet = sh.worksheet(supplier)
+        
+        # 3. 获取所有数据转为 DataFrame
+        records = worksheet.get_all_records()
+        rules_df = pd.DataFrame(records)
+        return rules_df, True
+        
+    except gspread.exceptions.WorksheetNotFound:
+        st.sidebar.error(f"❌ Google Sheet 中未找到名为 [{supplier}] 的 Tab 页！")
+        return None, False
+    except Exception as e:
+        st.sidebar.error(f"❌ 读取云端规则 API 异常: {e}")
+        return None, False
 
 # -----------------------------------------------------------------------------
 # 2. UI 界面布局
@@ -50,21 +71,22 @@ with st.sidebar:
     uploaded_file = st.file_uploader("请上传报价单 (Excel)", type=["xlsx", "xls"])
     
     supplier = "Unknown"
-    rule_path = None
+    rules_df = None
     has_rule = False
 
     if uploaded_file:
         supplier = detect_supplier(uploaded_file)
-        rule_path, has_rule = get_mapping_rule_path(supplier)
+        # 调用 API 拿到的不是文件路径，而是直接包含规则数据的 DataFrame
+        rules_df, has_rule = fetch_rules_from_gsheet(supplier)
         
         st.divider()
         st.markdown(f"**识别供应商:** `{supplier}`")
-        st.markdown(f"**路由配置文件:** `{rule_path}`")
+        st.markdown(f"**云端规则 Tab:** `{supplier if has_rule else '未拉取到'}`")
         
         if has_rule:
-            st.success("✅ 找到匹配的映射规则！")
+            st.success("✅ 成功调取 Google Sheet 云端规则！")
         else:
-            st.warning("⚠️ 暂未找到该供应商的映射规则文件。")
+            st.warning("⚠️ 暂未获得该供应商的解析规则。")
 
     parse_btn = st.button("开始运行解析", type="primary", disabled=(not has_rule))
 
@@ -72,7 +94,7 @@ with st.sidebar:
 if not uploaded_file:
     st.info("👈 请在左侧侧边栏上传 Excel 报价单。")
 else:
-    tab1, tab2 = st.tabs(["📋 原始 Sheet 预览", "🚀 解析结果预测"])
+    tab1, tab2, tab3 = st.tabs(["📋 原始 Sheet 预览", "⚙️ 云端映射规则", "🚀 解析结果预测"])
 
     with tab1:
         st.subheader("Excel 包含的 Sheet 清单")
@@ -85,11 +107,18 @@ else:
             st.dataframe(df_preview, use_container_width=True)
 
     with tab2:
+        st.subheader(f"[{supplier}] Google Sheet 实时映射规则")
+        if has_rule and rules_df is not None:
+            st.dataframe(rules_df, use_container_width=True)
+        else:
+            st.write("暂无规则数据。")
+
+    with tab3:
         if parse_btn:
-            st.subheader(f"使用 [{rule_path}] 运行解析中...")
-            # TODO: 此处后续只需一行代码调用你的通用解析器：
-            # parsed_df = run_parser(uploaded_file, rule_path)
+            st.subheader(f"使用云端 [{supplier}] 映射规则解析中...")
+            # TODO: 此处后续直接把文件和 rules_df 传给具体的 parser：
+            # parsed_df = run_parser(uploaded_file, rules_df)
             # st.dataframe(parsed_df)
-            st.info("路由运行成功！请在此处接入具体 parser 的返回数据。")
+            st.info("路由运行成功！已就绪 API 返回的规则数据，请在此处接入解析代码。")
         else:
             st.caption("请点击侧边栏的【开始运行解析】执行路由。")
