@@ -286,4 +286,4 @@ if btn_start and uploaded_file:
                     st.balloons()
                     st.success(f"🎉 同步完成！【{target_country}】工作表当前共 {total_count} 条数据。")
                 except Exception as e:
-                    st.error(f"❌ 写入失败: {e}")v
+                    st.error(f"❌ 写入失败: {e}")
