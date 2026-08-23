@@ -7,12 +7,11 @@ from oauth2client.service_account import ServiceAccountCredentials
 from openai import OpenAI
 
 # =============================================================================
-# 【公开配置区】只留大模型的基础常量。机密数据和ID全部从 st.secrets 读取
+# 【公开配置区】
 # =============================================================================
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 MODEL_NAME = "qwen3.7-plus"
 
-# 从你截图里的 Secrets 读取
 try:
     RULE_SHEET_ID = st.secrets["RULE_SHEET_ID"]
     DATA_SHEET_ID = st.secrets["DATA_SHEET_ID"]
@@ -20,22 +19,18 @@ except KeyError as e:
     st.error(f"❌ 严重错误: 未在 Streamlit Secrets 中找到 {e} 配置！")
     st.stop()
 
-# 联合主键定义
 COMPOSITE_PRIMARY_KEYS = ["ID", "Destination Country", "Weight Range (max kg)"]
 
 # =============================================================================
-# Google Sheet 客户端与规则读取 (安全读取你截图中的 gcp_json)
+# Google Sheet 连接
 # =============================================================================
+@st.cache_resource
 def get_gspread_client():
     try:
-        # 读取你截图里配置的多行字符串 gcp_json，并转成字典
         gcp_json_str = st.secrets["gcp_json"]
         creds_dict = json.loads(gcp_json_str, strict=False)
-    except KeyError:
-        st.error("❌ 严重错误: 未在 Streamlit Secrets 中找到 gcp_json 配置！")
-        st.stop()
-    except json.JSONDecodeError:
-        st.error("❌ 严重错误: gcp_json 内容不是合法的 JSON 格式，请检查。")
+    except Exception as e:
+        st.error(f"❌ 严重错误: GCP JSON 解析失败 - {str(e)}")
         st.stop()
 
     creds = ServiceAccountCredentials.from_json_keyfile_dict(
@@ -44,40 +39,33 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 def load_strict_rules(supplier_code: str) -> pd.DataFrame:
-    """严格读取指定供应商的规则 Tab"""
     client = get_gspread_client()
     sh = client.open_by_key(RULE_SHEET_ID)
     try:
         ws = sh.worksheet(supplier_code)
-    except gspread.exceptions.WorksheetNotFound:
-        raise ValueError(f"❌ 规则表(Sheet A)中不存在名为【{supplier_code}】的Tab！")
-    
-    records = ws.get_all_records()
-    if not records:
-        raise ValueError(f"❌ 规则表【{supplier_code}】内容为空！")
-    return pd.DataFrame(records)
+        records = ws.get_all_records()
+        return pd.DataFrame(records)
+    except Exception as e:
+        raise ValueError(f"❌ 读取规则表【{supplier_code}】失败: {str(e)}")
 
 # =============================================================================
-# 辅助处理函数
+# 核心大模型调用 (加入强力缓存，相同文本不再重复请求，速度提升数十倍！)
 # =============================================================================
+@st.cache_data(show_spinner=False, max_entries=500)
 def call_qwen_llm(prompt_text: str, text_context: str) -> str:
-    """调用 Qwen 提取数据"""
-    try:
-        # 对应你截图里的 API_KEY
-        api_key = st.secrets["API_KEY"]
-    except KeyError:
-        return "error: Missing API_KEY in secrets"
-
-    if not prompt_text: return "unknown"
+    if not prompt_text or not str(text_context).strip(): 
+        return "unknown"
     
     try:
+        api_key = st.secrets["API_KEY"]
         client = OpenAI(api_key=api_key, base_url=BASE_URL)
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
-                {"role": "system", "content": "你是一个严谨的数据提取接口，直接回答结果，无须多余解释。"},
-                {"role": "user", "content": f"{prompt_text}\n\n待分析文本：\n{text_context}"}
-            ]
+                {"role": "system", "content": "你是一个严谨的数据提取专家。请仅根据用户提供的文本提取信息，直接回答提取结果，严格按照要求的数据格式，不要有任何多余的废话、解释或开头。"},
+                {"role": "user", "content": f"提取指令：{prompt_text}\n\n待分析文本内容：\n{text_context}"}
+            ],
+            temperature=0.1 # 降低随机性，保证提取更准确
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -90,7 +78,6 @@ def safe_float(val):
     except: return 0.0
 
 def generate_weight_steps(excel_w_min: float, excel_w_max: float) -> list:
-    """按 0.25kg 递增生成阶梯重量"""
     standard_intervals = [
         (0.00, 0.25), (0.25, 0.50), (0.50, 0.75), (0.75, 1.00),
         (1.00, 1.25), (1.25, 1.50), (1.50, 1.75), (1.75, 2.00),
@@ -116,45 +103,61 @@ def parse_excel_weight_string(weight_str: str) -> tuple:
     return 0.0, 999.0
 
 # =============================================================================
-# 核心解析引擎 (严格基于 Sheet A 规则映射)
+# 一次性读取 Excel 减少 IO 操作
 # =============================================================================
-def parse_with_rules(uploaded_file, target_country: str, rules_df: pd.DataFrame) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def load_excel_all_sheets(file_bytes) -> dict:
+    return pd.read_excel(file_bytes, sheet_name=None, header=None)
+
+# =============================================================================
+# 核心解析引擎 
+# =============================================================================
+def parse_with_rules(all_sheets: dict, target_country: str, rules_df: pd.DataFrame):
     rule_map = {}
     for _, r in rules_df.iterrows():
         field = str(r.get("说明", r.get("字段名称", r.get("Field", "")))).strip()
-        instr = str(r.get("Python / LLM 机器指令 (转译)", "")).strip()
-        loc = str(r.get("列名称-定位", "")).strip()
-        rule_map[field] = {"instruction": instr, "loc_col": loc}
+        rule_map[field] = {
+            "instruction": str(r.get("Python / LLM 机器指令 (转译)", "")).strip(),
+            "loc_col": str(r.get("列名称-定位", "")).strip()
+        }
 
-    excel_file = pd.ExcelFile(uploaded_file)
     all_rows = []
+    
+    # 提取常用定位列名
+    country_col_name = rule_map.get("Destination Country", {}).get("loc_col", "Destination Country")
+    weight_col_name = rule_map.get("Weight Range (min kg)", {}).get("loc_col", "重量段") 
+    freight_col_name = rule_map.get("RMB /kg", {}).get("loc_col", "运费")
+    reg_col_name = rule_map.get("RMB /parcel", {}).get("loc_col", "挂号费")
+    time_col_name = rule_map.get("Time (workday/nature day)", {}).get("loc_col", "时效")
+    vol_limit_col_name = rule_map.get("Volume Limit (cm)", {}).get("loc_col", "标准尺寸")
 
-    country_col_name = rule_map.get("Destination Country", {}).get("loc_col", "")
-    weight_col_name = rule_map.get("Weight Range (min kg)", {}).get("loc_col", "") 
-    freight_col_name = rule_map.get("RMB /kg", {}).get("loc_col", "")
-    reg_col_name = rule_map.get("RMB /parcel", {}).get("loc_col", "")
-    time_col_name = rule_map.get("Time (workday/nature day)", {}).get("loc_col", "")
-    vol_limit_col_name = rule_map.get("Volume Limit (cm)", {}).get("loc_col", "")
+    # === 构建进度条 UI ===
+    sheet_names = list(all_sheets.keys())
+    total_sheets = len(sheet_names)
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, sheet_name in enumerate(sheet_names):
+        # 更新界面进度
+        progress_bar.progress((i + 1) / total_sheets)
+        status_text.markdown(f"**正在分析线路 [{i+1}/{total_sheets}]:** `{sheet_name}`")
+        
+        if any(kw in sheet_name for kw in ["目录", "对应表", "邮编", "禁运", "异形", "VAT"]): 
+            continue
 
-    for sheet_name in excel_file.sheet_names:
-        if any(kw in sheet_name for kw in ["目录", "对应表", "邮编", "禁运", "异形", "VAT"]): continue
-        df_raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None)
+        df_raw = all_sheets[sheet_name]
         if df_raw.empty: continue
 
-        id_instr = rule_map.get("ID", {}).get("instruction", r"r'\(([A-Z0-9]+)\)'")
-        regex_match = re.search(r"r'([^']+)'", id_instr)
-        pattern = regex_match.group(1) if regex_match else r'\(([A-Z0-9]+)\)'
-        id_res = re.search(pattern, sheet_name)
-        channel_id = id_res.group(1) if id_res else sheet_name.strip()
-        
+        # 提取 ID 逻辑：查找括号内字符
+        id_match = re.search(r'\(([A-Z0-9]+)\)', sheet_name)
+        channel_id = id_match.group(1) if id_match else sheet_name.strip()
         cargo_category = "Regular" if "普货" in sheet_name else "Sensitive"
 
-        header_idx = -1
-        instruction_start_idx = -1
-        
+        # 定位表头和说明文本
+        header_idx, instruction_start_idx = -1, -1
         for idx, row in df_raw.iterrows():
             row_str = "".join([str(v) for v in row.values if pd.notna(v)])
-            if header_idx == -1 and country_col_name and country_col_name in row_str:
+            if header_idx == -1 and country_col_name in row_str:
                 header_idx = idx
             if instruction_start_idx == -1 and any(kw in row_str for kw in ["价格使用说明", "申报及税费", "计重规则"]):
                 instruction_start_idx = idx
@@ -165,38 +168,44 @@ def parse_with_rules(uploaded_file, target_country: str, rules_df: pd.DataFrame)
         df_data = df_raw.iloc[header_idx + 1 : instruction_start_idx if instruction_start_idx != -1 else None].copy()
         df_data.columns = headers
 
-        country_col = next((c for c in headers if country_col_name and country_col_name in c), None)
-        weight_col = next((c for c in headers if weight_col_name and weight_col_name in c), None)
-        freight_col = next((c for c in headers if freight_col_name and freight_col_name in c), None)
-        reg_col = next((c for c in headers if reg_col_name and reg_col_name in c), None)
-        time_col = next((c for c in headers if time_col_name and time_col_name in c), None)
-        vol_limit_col = next((c for c in headers if vol_limit_col_name and vol_limit_col_name in c), None)
-
+        # 在表头中精确找列
+        country_col = next((c for c in headers if country_col_name in c), None)
+        weight_col = next((c for c in headers if weight_col_name in c), None)
         if not country_col or not weight_col: continue
 
+        # 过滤目标国家
         df_target = df_data[df_data[country_col].astype(str).str.strip() == target_country]
         if df_target.empty: continue
 
+        # 合并底部说明文本用于大模型读取
         instruction_text = ""
         if instruction_start_idx != -1:
             raw_text = df_raw.iloc[instruction_start_idx:].values.flatten()
             instruction_text = "\n".join([str(v).strip() for v in raw_text if pd.notna(v) and str(v).strip()])
 
+        # 获取规则指令
         cargo_fb_instr = rule_map.get("Cargo forbidden", {}).get("instruction", "")
         tax_instr = rule_map.get("Tax Policy", {}).get("instruction", "")
         pack_instr = rule_map.get("Pick&Packing/parcel", {}).get("instruction", "")
         vol_param_instr = rule_map.get("Volume to Weight parameter", {}).get("instruction", "")
 
+        # 调用大模型 (因有缓存，如果各表下方文字相同，会秒回)
         cargo_forbidden = call_qwen_llm(cargo_fb_instr, instruction_text) if cargo_fb_instr else "unknown"
         tax_policy = call_qwen_llm(tax_instr, instruction_text) if tax_instr else "unknown"
         pick_packing_parcel = safe_float(call_qwen_llm(pack_instr, instruction_text)) if pack_instr else 0.0
 
+        # 体积系数（优先正则抓取，失败再走LLM）
         vol_match = re.search(r'/\s*(\d{4})', instruction_text)
         vol_to_weight = int(vol_match.group(1)) if vol_match else (safe_float(call_qwen_llm(vol_param_instr, instruction_text)) if vol_param_instr else 8000)
         if vol_to_weight == 0: vol_to_weight = 8000
 
+        # 行级时效与尺寸读取
         time_instr = rule_map.get("Time (workday/nature day)", {}).get("instruction", "")
         vol_instr = rule_map.get("Volume Limit (cm)", {}).get("instruction", "")
+        time_col = next((c for c in headers if time_col_name in c), None)
+        vol_limit_col = next((c for c in headers if vol_limit_col_name in c), None)
+        freight_col = next((c for c in headers if freight_col_name in c), None)
+        reg_col = next((c for c in headers if reg_col_name in c), None)
 
         for _, row in df_target.iterrows():
             time_cell_text = str(row[time_col]) if time_col else ""
@@ -229,7 +238,10 @@ def parse_with_rules(uploaded_file, target_country: str, rules_df: pd.DataFrame)
                     "RMB in total": total_rmb,
                     "Tax Policy": tax_policy
                 })
-                
+    
+    # 扫尾 UI 处理
+    status_text.markdown("✅ **分析完毕，正在整理数据...**")
+    progress_bar.empty()
     return pd.DataFrame(all_rows)
 
 def upsert_to_google_sheet_b(new_df: pd.DataFrame, target_country: str) -> int:
@@ -259,7 +271,7 @@ def upsert_to_google_sheet_b(new_df: pd.DataFrame, target_country: str) -> int:
 # Streamlit 界面
 # =============================================================================
 st.set_page_config(page_title="完全规则映射解析器", layout="wide")
-st.title("📦 完全规则映射解析器 (安全集成版)")
+st.title("📦 完全规则映射解析器 (安全加速版)")
 st.divider()
 
 with st.sidebar:
@@ -273,27 +285,35 @@ with st.sidebar:
     btn_start = st.button("🚀 严格读取规则并解析", type="primary", disabled=(not uploaded_file or not target_country))
 
 if btn_start and uploaded_file:
+    # 步骤 1：读取规则
     with st.spinner(f"正在严格读取规则表【{supplier_code}】..."):
         try:
             strict_rules_df = load_strict_rules(supplier_code)
-            st.success(f"✅ 成功加载规则【{supplier_code}】，共 {len(strict_rules_df)} 条指令。")
-            with st.expander("查看当前映射规则明细"):
-                st.dataframe(strict_rules_df)
+            st.success(f"✅ 成功加载规则【{supplier_code}】")
         except Exception as e:
             st.error(str(e))
             st.stop() 
-
-    with st.spinner(f"正在按规则解析 Excel，提取【{target_country}】数据..."):
-        parsed_df = parse_with_rules(uploaded_file, target_country, strict_rules_df)
-        if parsed_df.empty:
-            st.error(f"❌ 未解析到国家为【{target_country}】的数据，请检查国家名或 Excel 结构与映射配置。")
-            st.stop()
             
-        st.dataframe(parsed_df, use_container_width=True)
+    # 步骤 2：读取超级大的 Excel 到内存 (只需要做一次)
+    file_bytes = uploaded_file.getvalue()
+    with st.spinner(f"📦 正在将大 Excel 文件加载到内存 (9.7MB可能需要十几秒，请稍等)..."):
+        all_sheets = load_excel_all_sheets(file_bytes)
+        st.success(f"✅ Excel 解析完成，共发现 {len(all_sheets.keys())} 个工作表。")
 
-        with st.spinner("正在写入数据到 Google Sheet B..."):
-            try:
-                count = upsert_to_google_sheet_b(parsed_df, target_country)
-                st.success(f"🎉 成功！【{target_country}】工作表当前共有 {count} 条数据。")
-            except Exception as e:
-                st.error(f"❌ 写入失败: {str(e)}")
+    # 步骤 3：跑业务逻辑 + LLM
+    st.markdown("### 🔄 正在通过 AI 提取数据")
+    parsed_df = parse_with_rules(all_sheets, target_country, strict_rules_df)
+    
+    if parsed_df.empty:
+        st.error(f"❌ 未在表格中成功提炼到国家为【{target_country}】的数据。")
+        st.stop()
+        
+    st.dataframe(parsed_df, use_container_width=True)
+
+    # 步骤 4：上传到谷歌表
+    with st.spinner("正在写入最终数据到目标 Google Sheet ..."):
+        try:
+            count = upsert_to_google_sheet_b(parsed_df, target_country)
+            st.success(f"🎉 成功！【{target_country}】工作表当前共有 {count} 条数据。")
+        except Exception as e:
+            st.error(f"❌ 写入失败: {str(e)}")
