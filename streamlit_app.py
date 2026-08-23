@@ -7,29 +7,35 @@ from oauth2client.service_account import ServiceAccountCredentials
 from openai import OpenAI
 
 # =============================================================================
-# 【公开配置区】这里只放非机密的常规配置 (机密信息已通过 st.secrets 读取)
+# 【公开配置区】只留大模型的基础常量。机密数据和ID全部从 st.secrets 读取
 # =============================================================================
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 MODEL_NAME = "qwen3.7-plus"
 
-# 1. 规则配置库 (Sheet A) 的 ID
-RULE_SHEET_ID = "1GjrPj2bKQZFz_ls5Y6ViI2fL_ovWcayN6ri58tiJErU"
-
-# 2. 数据结果库 (Sheet B) 的 ID
-DATA_SHEET_ID = "1MPodFY2AO4dvSOjY6oTDL4o0LwkbUhPqUJCkFVuICo8"
+# 从你截图里的 Secrets 读取
+try:
+    RULE_SHEET_ID = st.secrets["RULE_SHEET_ID"]
+    DATA_SHEET_ID = st.secrets["DATA_SHEET_ID"]
+except KeyError as e:
+    st.error(f"❌ 严重错误: 未在 Streamlit Secrets 中找到 {e} 配置！")
+    st.stop()
 
 # 联合主键定义
 COMPOSITE_PRIMARY_KEYS = ["ID", "Destination Country", "Weight Range (max kg)"]
 
 # =============================================================================
-# Google Sheet 客户端与规则读取 (安全读取 Secrets)
+# Google Sheet 客户端与规则读取 (安全读取你截图中的 gcp_json)
 # =============================================================================
 def get_gspread_client():
     try:
-        # 提取存储在 st.secrets 中的 Google credentials
-        creds_dict = dict(st.secrets["gcp_service_account"])
+        # 读取你截图里配置的多行字符串 gcp_json，并转成字典
+        gcp_json_str = st.secrets["gcp_json"]
+        creds_dict = json.loads(gcp_json_str, strict=False)
     except KeyError:
-        st.error("❌ 严重错误: 未在 Streamlit Secrets 中找到 [gcp_service_account] 配置！")
+        st.error("❌ 严重错误: 未在 Streamlit Secrets 中找到 gcp_json 配置！")
+        st.stop()
+    except json.JSONDecodeError:
+        st.error("❌ 严重错误: gcp_json 内容不是合法的 JSON 格式，请检查。")
         st.stop()
 
     creds = ServiceAccountCredentials.from_json_keyfile_dict(
@@ -38,7 +44,7 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 def load_strict_rules(supplier_code: str) -> pd.DataFrame:
-    """严格读取指定供应商的规则 Tab，不存在则直接抛出异常，绝不使用默认规则"""
+    """严格读取指定供应商的规则 Tab"""
     client = get_gspread_client()
     sh = client.open_by_key(RULE_SHEET_ID)
     try:
@@ -57,9 +63,10 @@ def load_strict_rules(supplier_code: str) -> pd.DataFrame:
 def call_qwen_llm(prompt_text: str, text_context: str) -> str:
     """调用 Qwen 提取数据"""
     try:
-        api_key = st.secrets["ALIYUN_API_KEY"]
+        # 对应你截图里的 API_KEY
+        api_key = st.secrets["API_KEY"]
     except KeyError:
-        return "error: Missing ALIYUN_API_KEY in secrets"
+        return "error: Missing API_KEY in secrets"
 
     if not prompt_text: return "unknown"
     
@@ -112,7 +119,6 @@ def parse_excel_weight_string(weight_str: str) -> tuple:
 # 核心解析引擎 (严格基于 Sheet A 规则映射)
 # =============================================================================
 def parse_with_rules(uploaded_file, target_country: str, rules_df: pd.DataFrame) -> pd.DataFrame:
-    # 建立映射字典
     rule_map = {}
     for _, r in rules_df.iterrows():
         field = str(r.get("说明", r.get("字段名称", r.get("Field", "")))).strip()
@@ -123,7 +129,6 @@ def parse_with_rules(uploaded_file, target_country: str, rules_df: pd.DataFrame)
     excel_file = pd.ExcelFile(uploaded_file)
     all_rows = []
 
-    # 提取需要的列名，不写死
     country_col_name = rule_map.get("Destination Country", {}).get("loc_col", "")
     weight_col_name = rule_map.get("Weight Range (min kg)", {}).get("loc_col", "") 
     freight_col_name = rule_map.get("RMB /kg", {}).get("loc_col", "")
@@ -136,7 +141,6 @@ def parse_with_rules(uploaded_file, target_country: str, rules_df: pd.DataFrame)
         df_raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None)
         if df_raw.empty: continue
 
-        # 1. ID 与货物类别提取 (通过正则指令)
         id_instr = rule_map.get("ID", {}).get("instruction", r"r'\(([A-Z0-9]+)\)'")
         regex_match = re.search(r"r'([^']+)'", id_instr)
         pattern = regex_match.group(1) if regex_match else r'\(([A-Z0-9]+)\)'
@@ -145,7 +149,6 @@ def parse_with_rules(uploaded_file, target_country: str, rules_df: pd.DataFrame)
         
         cargo_category = "Regular" if "普货" in sheet_name else "Sensitive"
 
-        # 2. 定位表头和底部说明区域
         header_idx = -1
         instruction_start_idx = -1
         
@@ -162,7 +165,6 @@ def parse_with_rules(uploaded_file, target_country: str, rules_df: pd.DataFrame)
         df_data = df_raw.iloc[header_idx + 1 : instruction_start_idx if instruction_start_idx != -1 else None].copy()
         df_data.columns = headers
 
-        # 3. 严格匹配用户配置的列名
         country_col = next((c for c in headers if country_col_name and country_col_name in c), None)
         weight_col = next((c for c in headers if weight_col_name and weight_col_name in c), None)
         freight_col = next((c for c in headers if freight_col_name and freight_col_name in c), None)
@@ -175,13 +177,11 @@ def parse_with_rules(uploaded_file, target_country: str, rules_df: pd.DataFrame)
         df_target = df_data[df_data[country_col].astype(str).str.strip() == target_country]
         if df_target.empty: continue
 
-        # 4. 抓取完整的底部说明文本 (不截断，全部发给 AI)
         instruction_text = ""
         if instruction_start_idx != -1:
             raw_text = df_raw.iloc[instruction_start_idx:].values.flatten()
             instruction_text = "\n".join([str(v).strip() for v in raw_text if pd.notna(v) and str(v).strip()])
 
-        # 5. 读取 AI 提取指令并发起请求
         cargo_fb_instr = rule_map.get("Cargo forbidden", {}).get("instruction", "")
         tax_instr = rule_map.get("Tax Policy", {}).get("instruction", "")
         pack_instr = rule_map.get("Pick&Packing/parcel", {}).get("instruction", "")
@@ -191,12 +191,10 @@ def parse_with_rules(uploaded_file, target_country: str, rules_df: pd.DataFrame)
         tax_policy = call_qwen_llm(tax_instr, instruction_text) if tax_instr else "unknown"
         pick_packing_parcel = safe_float(call_qwen_llm(pack_instr, instruction_text)) if pack_instr else 0.0
 
-        # 材积系数优先正则，其次 AI
         vol_match = re.search(r'/\s*(\d{4})', instruction_text)
         vol_to_weight = int(vol_match.group(1)) if vol_match else (safe_float(call_qwen_llm(vol_param_instr, instruction_text)) if vol_param_instr else 8000)
         if vol_to_weight == 0: vol_to_weight = 8000
 
-        # 6. 遍历目标国家的行
         time_instr = rule_map.get("Time (workday/nature day)", {}).get("instruction", "")
         vol_instr = rule_map.get("Volume Limit (cm)", {}).get("instruction", "")
 
@@ -235,7 +233,6 @@ def parse_with_rules(uploaded_file, target_country: str, rules_df: pd.DataFrame)
     return pd.DataFrame(all_rows)
 
 def upsert_to_google_sheet_b(new_df: pd.DataFrame, target_country: str) -> int:
-    """写入 Google Sheet B 结果表"""
     client = get_gspread_client()
     sh = client.open_by_key(DATA_SHEET_ID)
     try:
