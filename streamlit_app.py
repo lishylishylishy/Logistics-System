@@ -1,396 +1,744 @@
-import io, json, re
+import io
+import json
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+import gspread
 import pandas as pd
 import streamlit as st
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-# ========================= 配置 =========================
-RULE_SHEET_ID = st.secrets["RULE_SHEET_ID"]
-DATA_SHEET_ID = st.secrets["DATA_SHEET_ID"]
-AI_API_KEY = st.secrets["API_KEY"]
-BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-MODEL_NAME = "qwen3.7-plus"
-PRIMARY_KEYS = ["ID", "Destination Country", "Weight Range (max kg)"]
-STANDARD_WEIGHTS = [(0,.25),(.25,.5),(.5,.75),(.75,1),(1,1.25),(1.25,1.5),(1.5,1.75),(1.75,2),(2,2.25),(2.25,2.5),(2.5,2.75),(2.75,3)]
 
-# ========================= Google Sheets =========================
+# ============================================================
+# 1. 配置区：需要配置的内容全部集中在这里
+# ============================================================
+RULE_SHEET_ID = st.secrets["RULE_SHEET_ID"]      # 供应商映射规则库 Spreadsheet ID或URL
+DATA_SHEET_ID = st.secrets["DATA_SHEET_ID"]      # 最终数据 Spreadsheet ID或URL
+AI_API_KEY = st.secrets["API_KEY"]               # AI API Key
+GCP_JSON = st.secrets["gcp_json"]                 # Google Service Account JSON
+
+AI_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+AI_MODEL = "qwen3.7-plus"
+
+# 最终记录唯一键：三者相同就是同一条记录，新数据覆盖旧数据
+PRIMARY_KEYS = ["ID", "Destination Country", "Weight Range (max kg)"]
+
+# 通用固定业务规则：0~3kg，每0.25kg一个梯度
+STANDARD_WEIGHTS = [
+    (0.00, 0.25), (0.25, 0.50), (0.50, 0.75), (0.75, 1.00),
+    (1.00, 1.25), (1.25, 1.50), (1.50, 1.75), (1.75, 2.00),
+    (2.00, 2.25), (2.25, 2.50), (2.50, 2.75), (2.75, 3.00),
+]
+
+SUPPLIER_CONFIG_SHEET = "Supplier_Config"
+
+
+# ============================================================
+# 2. 页面
+# ============================================================
+st.set_page_config(page_title="物流报价解析系统", page_icon="📦", layout="wide")
+st.title("📦 物流报价解析系统")
+st.caption("上传报价表 → 自动识别供应商 → 加载对应Mapping → 输入目标国家 → 解析与预览 → 确认更新")
+
+
+# ============================================================
+# 3. 基础工具
+# ============================================================
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return re.sub(r"\s+", " ", str(value).replace("\u3000", " ")).strip()
+
+
+def spreadsheet_key(value: str) -> str:
+    value = normalize_text(value)
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", value)
+    return m.group(1) if m else value
+
+
+def as_bool(value: Any) -> bool:
+    return normalize_text(value).lower() in {"true", "1", "yes", "y", "是", "启用"}
+
+
+def safe_float(value: Any) -> Optional[float]:
+    text = normalize_text(value).replace(",", "").replace("，", "")
+    if not text:
+        return None
+    m = re.search(r"-?\d+(?:\.\d+)?", text)
+    return float(m.group()) if m else None
+
+
+# ============================================================
+# 4. Google Sheets连接
+# ============================================================
 @st.cache_resource
 def get_gsheet_client():
-    creds = json.loads(st.secrets["gcp_json"], strict=False)
-    scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    return gspread.authorize(ServiceAccountCredentials.from_json_keyfile_dict(creds, scopes))
+    try:
+        info = json.loads(GCP_JSON, strict=False)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        credentials = Credentials.from_service_account_info(info, scopes=scopes)
+        return gspread.authorize(credentials)
+    except Exception as e:
+        raise RuntimeError(f"Google认证失败：{e}")
 
-def load_sheet(spreadsheet_id, worksheet_name):
-    sh = get_gsheet_client().open_by_key(spreadsheet_id)
-    ws = sh.worksheet(worksheet_name)
-    return pd.DataFrame(ws.get_all_records()), ws
 
-def load_supplier_config():
-    df, _ = load_sheet(RULE_SHEET_ID, "Supplier_Config")
-    required = ["Supplier Code","Supplier Name","Enabled","Detection Type","Detection Value","Mapping Sheet"]
+def open_spreadsheet(spreadsheet_id_or_url: str):
+    key = spreadsheet_key(spreadsheet_id_or_url)
+    try:
+        return get_gsheet_client().open_by_key(key)
+    except gspread.exceptions.SpreadsheetNotFound as e:
+        raise RuntimeError(
+            f"无法打开Google Spreadsheet。\n"
+            f"Spreadsheet ID：{key}\n"
+            f"请确认RULE_SHEET_ID/DATA_SHEET_ID正确，并确认gcp_json中的client_email已共享该Spreadsheet。"
+        ) from e
+    except gspread.exceptions.APIError as e:
+        raise RuntimeError(f"Google Sheets API错误：{e}") from e
+    except PermissionError as e:
+        raise RuntimeError(
+            f"Google Spreadsheet权限不足。\n"
+            f"Spreadsheet ID：{key}\n"
+            f"请确认gcp_json中的client_email已被共享为Viewer或Editor。"
+        ) from e
+
+
+@st.cache_data(show_spinner=False)
+def load_google_records(spreadsheet_id_or_url: str, worksheet_name: str) -> pd.DataFrame:
+    sh = open_spreadsheet(spreadsheet_id_or_url)
+    try:
+        ws = sh.worksheet(worksheet_name)
+    except gspread.exceptions.WorksheetNotFound as e:
+        raise RuntimeError(f"Spreadsheet中找不到工作表：{worksheet_name}") from e
+    records = ws.get_all_records()
+    return pd.DataFrame(records)
+
+
+def get_google_worksheet(spreadsheet_id_or_url: str, worksheet_name: str, create=False):
+    sh = open_spreadsheet(spreadsheet_id_or_url)
+    try:
+        return sh.worksheet(worksheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        if create:
+            return sh.add_worksheet(title=worksheet_name, rows=2000, cols=30)
+        raise
+
+
+# ============================================================
+# 5. Supplier_Config：自动识别供应商
+# ============================================================
+def load_supplier_config() -> pd.DataFrame:
+    df = load_google_records(RULE_SHEET_ID, SUPPLIER_CONFIG_SHEET)
+    required = ["Supplier Code", "Supplier Name", "Enabled", "Detection Type", "Detection Value", "Mapping Sheet"]
     missing = [c for c in required if c not in df.columns]
-    if missing: raise ValueError(f"Supplier_Config 缺少列：{', '.join(missing)}")
+    if missing:
+        raise RuntimeError(f"Supplier_Config缺少列：{', '.join(missing)}")
     return df
 
-def load_mapping(sheet_name):
-    df, _ = load_sheet(RULE_SHEET_ID, sheet_name)
-    required = ["字段","是否AI读取","提取粒度","记录唯一键","Sheet定位类型","Sheet定位值","行定位类型","行定位值","列定位类型","列定位值","原始提取类型","Python解析器","AI指令","是否必填"]
-    missing = [c for c in required if c not in df.columns]
-    if missing: raise ValueError(f"Mapping【{sheet_name}】缺少列：{', '.join(missing)}")
-    return df
 
-# ========================= 通用工具 =========================
-def norm(v):
-    if v is None or pd.isna(v): return ""
-    return re.sub(r"\s+", " ", str(v).replace("\u3000", " ")).strip()
+def match_text_rule(text: str, rule_type: str, rule_value: str) -> bool:
+    text, rule_value = normalize_text(text), normalize_text(rule_value)
+    if rule_type == "exact":
+        return text == rule_value
+    if rule_type == "contains":
+        return rule_value in text
+    if rule_type == "regex":
+        try:
+            return bool(re.search(rule_value, text, re.I))
+        except re.error as e:
+            raise RuntimeError(f"Supplier_Config正则错误：{rule_value}；{e}") from e
+    raise RuntimeError(f"不支持的Detection Type：{rule_type}")
 
-def enabled(v): return norm(v).lower() in {"true","1","yes","y","是"}
 
-def rule(rules, field):
-    x = rules[rules["字段"].astype(str).str.strip() == field]
-    if x.empty: raise ValueError(f"Mapping 缺少字段：{field}")
-    return x.iloc[0].to_dict()
-
-def safe_float(v):
-    if v is None or pd.isna(v): return None
-    m = re.search(r"-?\d+(?:,\d{3})*(?:\.\d+)?", str(v))
-    return float(m.group().replace(",", "")) if m else None
-
-def match_rule(text, typ, val):
-    text, val = norm(text), norm(val)
-    if typ in ("none", ""): return True
-    if typ == "exact": return text == val
-    if typ == "contains": return val in text
-    if typ == "regex": return bool(re.search(val, text, re.I))
-    raise ValueError(f"不支持的定位类型：{typ}")
-
-# ========================= 供应商识别 =========================
-def detect_supplier(all_sheets):
+def detect_supplier(all_sheets: Dict[str, pd.DataFrame]) -> Tuple[str, str, str]:
     config = load_supplier_config()
-    active = config[config["Enabled"].map(enabled)]
+    enabled = config[config["Enabled"].apply(as_bool)]
     matches = []
-    for _, r in active.iterrows():
-        score = sum(match_rule(s, r["Detection Type"], r["Detection Value"]) for s in all_sheets)
-        if score: matches.append((score, r))
-    if not matches: raise ValueError("无法识别供应商，请检查 Supplier_Config 的 Detection Rule。")
+    for _, row in enabled.iterrows():
+        rule_type = normalize_text(row["Detection Type"])
+        rule_value = normalize_text(row["Detection Value"])
+        hit_sheets = [s for s in all_sheets if match_text_rule(s, rule_type, rule_value)]
+        if hit_sheets:
+            matches.append((len(hit_sheets), row, hit_sheets))
+    if not matches:
+        raise RuntimeError("无法识别供应商。请检查Supplier_Config中的Detection Type和Detection Value。")
     matches.sort(key=lambda x: x[0], reverse=True)
     if len(matches) > 1 and matches[0][0] == matches[1][0]:
-        raise ValueError(f"供应商识别冲突：{matches[0][1]['Supplier Code']} / {matches[1][1]['Supplier Code']}")
-    r = matches[0][1]
-    return norm(r["Supplier Code"]), norm(r["Supplier Name"]), norm(r["Mapping Sheet"])
+        a, b = matches[0][1], matches[1][1]
+        raise RuntimeError(f"供应商识别冲突：{a['Supplier Code']} / {b['Supplier Code']}")
+    row = matches[0][1]
+    return normalize_text(row["Supplier Code"]), normalize_text(row["Supplier Name"]), normalize_text(row["Mapping Sheet"])
 
-# ========================= Excel =========================
+
+# ============================================================
+# 6. 读取供应商Mapping
+# ============================================================
+def load_mapping(mapping_sheet: str) -> pd.DataFrame:
+    df = load_google_records(RULE_SHEET_ID, mapping_sheet)
+    required = [
+        "字段", "是否AI读取", "提取粒度", "记录唯一键",
+        "Sheet定位类型", "Sheet定位值",
+        "行定位类型", "行定位值",
+        "列定位类型", "列定位值",
+        "原始提取类型", "Python解析器", "AI指令", "是否必填",
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"Mapping【{mapping_sheet}】缺少列：{', '.join(missing)}")
+    return df
+
+
+def get_rule(rules: pd.DataFrame, field: str) -> Dict[str, Any]:
+    hit = rules[rules["字段"].astype(str).str.strip() == field]
+    if hit.empty:
+        raise RuntimeError(f"Mapping中没有字段：{field}")
+    return hit.iloc[0].to_dict()
+
+
+# ============================================================
+# 7. Excel读取
+# ============================================================
 @st.cache_data(show_spinner=False)
-def load_excel(file_bytes):
+def load_excel(file_bytes: bytes) -> Dict[str, pd.DataFrame]:
     return pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=None)
 
-def locate_sheets(all_sheets, r):
-    return [s for s in all_sheets if match_rule(s, r["Sheet定位类型"], r["Sheet定位值"])]
 
-def find_cell(df, typ, val, start_row=0):
-    for rr in range(start_row, len(df)):
-        for cc in range(df.shape[1]):
-            t = norm(df.iat[rr, cc])
-            if typ == "exact_header" and t == norm(val): return rr, cc
-            if typ == "contains_header" and norm(val) in t: return rr, cc
-            if typ == "exact_text" and t == norm(val): return rr, cc
-            if typ == "contains_text" and norm(val) in t: return rr, cc
+# ============================================================
+# 8. Mapping定位引擎
+# ============================================================
+def locate_sheets(all_sheets: Dict[str, pd.DataFrame], rule: Dict[str, Any]) -> List[str]:
+    typ, val = normalize_text(rule["Sheet定位类型"]), normalize_text(rule["Sheet定位值"])
+    return [s for s in all_sheets if match_text_rule(s, typ, val)]
+
+
+def find_cell(df: pd.DataFrame, locator_type: str, locator_value: str, start_row: int = 0, end_row: Optional[int] = None):
+    locator_type, locator_value = normalize_text(locator_type), normalize_text(locator_value)
+    end_row = len(df) if end_row is None else min(end_row, len(df))
+    for r in range(start_row, end_row):
+        for c in range(df.shape[1]):
+            text = normalize_text(df.iat[r, c])
+            if locator_type == "exact_header" and text == locator_value:
+                return r, c
+            if locator_type == "contains_header" and locator_value in text:
+                return r, c
+            if locator_type == "exact_text" and text == locator_value:
+                return r, c
+            if locator_type == "contains_text" and locator_value in text:
+                return r, c
     return None
 
-def find_column(df, r):
-    x = find_cell(df, norm(r["列定位类型"]), norm(r["列定位值"]))
-    if not x: raise ValueError(f"找不到列：{r['列定位类型']} / {r['列定位值']}")
-    return x
 
-def section_start(df):
-    anchors = ["价格使用说明","计重规则","申报及税费"]
-    for rr in range(len(df)):
-        text = " ".join(norm(v) for v in df.iloc[rr].tolist() if norm(v))
-        if any(a in text for a in anchors): return rr
+def find_country_column(df: pd.DataFrame, rule: Dict[str, Any]) -> Tuple[int, int]:
+    hit = find_cell(df, normalize_text(rule["列定位类型"]), normalize_text(rule["列定位值"]))
+    if not hit:
+        raise RuntimeError(f"无法定位国家列：{rule['列定位类型']} / {rule['列定位值']}")
+    return hit
+
+
+def find_section_start(df: pd.DataFrame) -> int:
+    anchors = ["价格使用说明", "计重规则", "申报及税费"]
+    for r in range(len(df)):
+        text = " ".join(normalize_text(v) for v in df.iloc[r].tolist() if normalize_text(v))
+        if any(a in text for a in anchors):
+            return r
     return len(df)
 
-def find_country_rows(df, country_rule, target_country):
-    header_row, country_col = find_column(df, country_rule)
-    end_row = section_start(df)
-    rows, current = [], ""
-    for rr in range(header_row + 1, end_row):
-        value = norm(df.iat[rr, country_col])
-        if value: current = value
-        if current == norm(target_country): rows.append(rr)
+
+def find_country_rows(df: pd.DataFrame, country_rule: Dict[str, Any], target_country: str) -> Tuple[int, int, List[int]]:
+    header_row, country_col = find_country_column(df, country_rule)
+    end_row = find_section_start(df)
+    rows, current_country = [], ""
+    target_country = normalize_text(target_country)
+    for r in range(header_row + 1, end_row):
+        value = normalize_text(df.iat[r, country_col])
+        if value:
+            current_country = value
+        if current_country == target_country:
+            rows.append(r)
     return header_row, country_col, rows
 
-def extract_section(df, anchor):
-    start = None
-    for rr in range(len(df)):
-        text = " ".join(norm(v) for v in df.iloc[rr].tolist() if norm(v))
-        if anchor in text:
-            start = rr; break
-    if start is None: return ""
-    anchors = ["价格使用说明","计重规则","申报及税费"]
-    out = []
-    for rr in range(start, len(df)):
-        text = " | ".join(norm(v) for v in df.iloc[rr].tolist() if norm(v))
-        if not text: continue
-        if rr > start and any(a in text for a in anchors if a != anchor): break
-        out.append(f"Excel Row {rr + 1}: {text}")
-    return "\n".join(out)
 
-# ========================= 固定 Python 规则 =========================
-def extract_id(sheet_name):
+def extract_section(df: pd.DataFrame, anchor: str) -> str:
+    start = None
+    for r in range(len(df)):
+        text = " ".join(normalize_text(v) for v in df.iloc[r].tolist() if normalize_text(v))
+        if anchor in text:
+            start = r
+            break
+    if start is None:
+        return ""
+    stop_anchors = ["价格使用说明", "计重规则", "申报及税费"]
+    lines = []
+    for r in range(start, len(df)):
+        text = " | ".join(normalize_text(v) for v in df.iloc[r].tolist() if normalize_text(v))
+        if not text:
+            continue
+        if r > start and any(a in text for a in stop_anchors if a != anchor):
+            break
+        lines.append(f"Excel Row {r + 1}: {text}")
+    return "\n".join(lines)
+
+
+# ============================================================
+# 9. Python通用解析
+# ============================================================
+def extract_id(sheet_name: str) -> str:
     m = re.search(r"[\(（]([A-Za-z0-9]+)[\)）]", sheet_name)
-    if not m: raise ValueError(f"无法从 Sheet 名称提取 ID：{sheet_name}")
+    if not m:
+        raise RuntimeError(f"无法从Sheet名称提取ID：{sheet_name}")
     return m.group(1)
 
-def cargo_category(sheet_name):
-    if "普货" in sheet_name: return "Regular"
-    if any(x in sheet_name for x in ["带电","特货","敏感"]): return "Sensitive"
+
+def cargo_category(sheet_name: str) -> Optional[str]:
+    if "普货" in sheet_name:
+        return "Regular"
+    if any(x in sheet_name for x in ["带电", "特货", "敏感"]):
+        return "Sensitive"
     return None
 
-def generate_weights(source_min, source_max):
-    if source_min is None or source_max is None or source_min >= source_max: return []
-    out = []
-    for smin, smax in STANDARD_WEIGHTS:
-        if smax <= source_min or smin >= source_max: continue
-        wmin, wmax = max(smin, source_min), min(smax, source_max)
-        if source_min >= 1 and wmin == smin: wmin = 1.0
-        elif source_min > 1 and wmin == source_min: wmin = round(source_min + .01, 2)
-        if source_max <= 1 and wmax == smax: wmax = 1.0
-        elif source_max < 1 and wmax == source_max: wmax = round(source_max - .01, 2)
-        out.append((round(wmin,2), round(wmax,2)))
-    return out
 
-# ========================= AI =========================
+def parse_weight_range(text: Any) -> Tuple[Optional[float], Optional[float]]:
+    s = normalize_text(text).upper().replace("KG", "").replace(" ", "")
+    patterns = [
+        r"(\d+(?:\.\d+)?)<W[≤<=](\d+(?:\.\d+)?)",
+        r"W[≤<=](\d+(?:\.\d+)?)",
+        r"(\d+(?:\.\d+)?)\s*[-~～]\s*(\d+(?:\.\d+)?)",
+    ]
+    m = re.search(patterns[0], s)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    m = re.search(patterns[1], s)
+    if m:
+        return 0.0, float(m.group(1))
+    m = re.search(patterns[2], s)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    return None, None
+
+
+def generate_weight_steps(source_min: float, source_max: float) -> List[Tuple[float, float]]:
+    if source_min is None or source_max is None or source_min >= source_max:
+        return []
+    result = []
+    for smin, smax in STANDARD_WEIGHTS:
+        if smax <= source_min or smin >= source_max:
+            continue
+        wmin, wmax = max(smin, source_min), min(smax, source_max)
+        if source_min >= 1 and wmin == smin:
+            wmin = 1.0
+        elif source_min > 1 and wmin == source_min:
+            wmin = round(source_min + 0.01, 2)
+        if source_max <= 1 and wmax == smax:
+            wmax = 1.0
+        elif source_max < 1 and wmax == source_max:
+            wmax = round(source_max - 0.01, 2)
+        if wmax > wmin:
+            result.append((round(wmin, 2), round(wmax, 2)))
+    return result
+
+
+# ============================================================
+# 10. AI：复杂字段和重量行映射
+# ============================================================
 @st.cache_data(show_spinner=False, max_entries=500)
-def ai_json(prompt, context):
-    client = OpenAI(api_key=AI_API_KEY, base_url=BASE_URL)
-    response = client.chat.completions.create(model=MODEL_NAME, temperature=0, messages=[
-        {"role":"system","content":"你是严谨的物流报价表结构化提取专家。只能使用输入内容，不得猜测；无法确定返回null；必须返回合法JSON，不要输出Markdown。"},
-        {"role":"user","content":f"{prompt}\n\n原始数据：\n{context}"}
-    ])
+def call_ai_json(prompt: str, context: str) -> Dict[str, Any]:
+    client = OpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL)
+    response = client.chat.completions.create(
+        model=AI_MODEL,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": "你是严谨的物流报价表结构化提取专家。只能依据输入内容，不得猜测；无法确定时返回null；必须返回合法JSON。"},
+            {"role": "user", "content": f"{prompt}\n\n原始数据：\n{context}"},
+        ],
+    )
     raw = response.choices[0].message.content.strip()
-    raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.I)
+    raw = re.sub(r"^```json\s*", "", raw, flags=re.I)
+    raw = re.sub(r"\s*```$", "", raw)
     return json.loads(raw)
 
-def ai_metadata(target_country, country_context, note_text, weight_text, tax_text, time_cells, volume_cells, rules):
-    fields = ["Cargo forbidden","Time (workday/nature day)","Volume Limit (cm)","Volume to Weight parameter","Pick&Packing/parcel","Tax Policy"]
-    instructions = [f"{f}: {norm(rule(rules,f)['AI指令'])}" for f in fields if enabled(rule(rules,f)["是否AI读取"])]
-    prompt = f'''目标国家：{target_country}\n\n根据以下AI指令提取：\n{chr(10).join(instructions)}\n\n严格返回JSON：{{"Cargo forbidden":[],"Time":{{"min":null,"max":null,"unit":null}},"Volume Limit":{{"length_cm":null,"width_cm":null,"height_cm":null,"max_length_cm":null,"max_volume_m3":null,"formula":null,"raw":null}},"Volume to Weight parameter":null,"Pick&Packing/parcel":null,"Tax Policy":{{"delivery_term":null,"fob_limit_usd":null,"cif_limit_usd":null,"raw":null}}}}\n\n只提取{target_country}；没有明确值返回null；不得猜测；Time只能使用提供的时效Cell；Volume Limit只能使用提供的标准尺寸Cell。'''
-    context = f"目标国家价格行：\n{country_context}\n\n目标国家时效Cell：\n{time_cells}\n\n目标国家标准尺寸Cell：\n{volume_cells}\n\n价格使用说明：\n{note_text}\n\n计重规则：\n{weight_text}\n\n申报及税费：\n{tax_text}"
-    return ai_json(prompt, context)
 
-def ai_weight_map(target_country, weight_rows, weight_rule):
-    prompt = f'''目标国家：{target_country}\n\n分析以下源重量区间。\n{norm(weight_rule["AI指令"])}\n\n标准目标max固定为：0.25、0.50、0.75、1.00、1.25、1.50、1.75、2.00、2.25、2.50、2.75、3.00。\n每个target_max_kg必须选择真实存在的source_excel_row；如果目标重量超过源最大计费重量，则返回null；不得创造行号。\n\n严格返回：{{"source_min_kg":null,"source_max_kg":null,"mapping":[{{"target_max_kg":0.25,"source_excel_row":12}}]}}'''
-    return ai_json(prompt, json.dumps(weight_rows, ensure_ascii=False))
+def ai_extract_metadata(target_country: str, country_context: str, note_text: str, weight_text: str, tax_text: str, rules: pd.DataFrame) -> Dict[str, Any]:
+    ai_fields = ["Cargo forbidden", "Time (workday/nature day)", "Volume Limit (cm)", "Volume to Weight parameter", "Pick&Packing/parcel", "Tax Policy"]
+    instructions = []
+    for field in ai_fields:
+        rule = get_rule(rules, field)
+        if as_bool(rule["是否AI读取"]):
+            instructions.append(f"{field}: {normalize_text(rule['AI指令'])}")
+    prompt = f"""
+目标国家：{target_country}
+只提取该国家，不要使用其他国家的信息。
 
-# ========================= AI结果格式化 =========================
-def format_time(v):
-    if not v: return None
-    if isinstance(v, dict):
-        mn, mx, unit = v.get("min"), v.get("max"), v.get("unit")
-        if mn is None: return None
+字段提取要求：
+{chr(10).join(instructions)}
+
+严格返回JSON：
+{{
+  "Cargo forbidden": [],
+  "Time": {{"min": null, "max": null, "unit": null}},
+  "Volume Limit": {{"length_cm": null, "width_cm": null, "height_cm": null, "max_length_cm": null, "max_volume_m3": null, "formula": null, "raw": null}},
+  "Volume to Weight parameter": null,
+  "Pick&Packing/parcel": null,
+  "Tax Policy": {{"delivery_term": null, "fob_limit_usd": null, "cif_limit_usd": null, "raw": null}}
+}}
+"""
+    context = f"目标国家价格行：\n{country_context}\n\n价格使用说明：\n{note_text}\n\n计重规则：\n{weight_text}\n\n申报及税费：\n{tax_text}"
+    return call_ai_json(prompt, context)
+
+
+def ai_map_weight_rows(target_country: str, weight_rows: List[Dict[str, Any]], rule: Dict[str, Any]) -> Dict[str, Any]:
+    prompt = f"""
+目标国家：{target_country}
+
+分析输入的真实Excel重量价格行。
+{normalize_text(rule['AI指令'])}
+
+固定目标重量max：
+0.25、0.50、0.75、1.00、1.25、1.50、1.75、2.00、2.25、2.50、2.75、3.00。
+
+严格返回：
+{{
+  "source_min_kg": null,
+  "source_max_kg": null,
+  "mapping": [
+    {{"target_max_kg": 0.25, "source_excel_row": 12}}
+  ]
+}}
+
+要求：
+1. source_excel_row必须是输入中真实存在的Excel Row。
+2. 每个target_max_kg选择实际覆盖该重量的源重量区间。
+3. 超过源最大计费重量的target_max_kg返回null。
+4. 不允许创造行号。
+5. 仅依据输入，不得猜测。
+"""
+    return call_ai_json(prompt, json.dumps(weight_rows, ensure_ascii=False, indent=2))
+
+
+# ============================================================
+# 11. AI结果格式化
+# ============================================================
+def format_time(value: Any) -> Optional[str]:
+    if not value:
+        return None
+    if isinstance(value, dict):
+        mn, mx, unit = value.get("min"), value.get("max"), value.get("unit")
+        if mn is None:
+            return None
         return f"{mn} {unit}" if mx is None or mn == mx else f"{mn}~{mx} {unit}"
-    return norm(v)
+    return normalize_text(value)
 
-def format_dimension(v):
-    if not v: return None
-    if not isinstance(v, dict): return norm(v)
-    p = []
-    if all(v.get(k) is not None for k in ["length_cm","width_cm","height_cm"]): p.append(f"{v['length_cm']}×{v['width_cm']}×{v['height_cm']} cm")
-    if v.get("max_length_cm") is not None: p.append(f"max_length={v['max_length_cm']}cm")
-    if v.get("max_volume_m3") is not None: p.append(f"max_volume={v['max_volume_m3']}m³")
-    if v.get("formula"): p.append(f"formula={v['formula']}")
-    return "; ".join(p) or v.get("raw")
 
-def format_tax(v):
-    if not v: return None
-    if not isinstance(v, dict): return norm(v)
-    p = [v["delivery_term"]] if v.get("delivery_term") else []
-    if v.get("fob_limit_usd") is not None: p.append(f"FOB < {v['fob_limit_usd']} USD")
-    if v.get("cif_limit_usd") is not None: p.append(f"CIF < {v['cif_limit_usd']} USD")
-    return ", ".join(p) or v.get("raw")
+def format_dimension(value: Any) -> Optional[str]:
+    if not value:
+        return None
+    if not isinstance(value, dict):
+        return normalize_text(value)
+    parts = []
+    if all(value.get(k) is not None for k in ["length_cm", "width_cm", "height_cm"]):
+        parts.append(f"{value['length_cm']}×{value['width_cm']}×{value['height_cm']} cm")
+    if value.get("max_length_cm") is not None:
+        parts.append(f"max_length={value['max_length_cm']}cm")
+    if value.get("max_volume_m3") is not None:
+        parts.append(f"max_volume={value['max_volume_m3']}m³")
+    if value.get("formula"):
+        parts.append(f"formula={value['formula']}")
+    return "; ".join(parts) or normalize_text(value.get("raw")) or None
 
-def format_forbidden(v):
-    return ", ".join(norm(x) for x in v if norm(x)) if isinstance(v,list) else norm(v)
 
-def pick_pack_value(v, weight_max):
-    if isinstance(v, dict):
-        by_weight = v.get("by_weight_max_kg", {})
-        value = by_weight.get(str(round(weight_max,2)))
-        return safe_float(value if value is not None else v.get("default"))
-    return safe_float(v)
+def format_tax(value: Any) -> Optional[str]:
+    if not value:
+        return None
+    if not isinstance(value, dict):
+        return normalize_text(value)
+    parts = []
+    if value.get("delivery_term"):
+        parts.append(str(value["delivery_term"]))
+    if value.get("fob_limit_usd") is not None:
+        parts.append(f"FOB < {value['fob_limit_usd']} USD")
+    if value.get("cif_limit_usd") is not None:
+        parts.append(f"CIF < {value['cif_limit_usd']} USD")
+    return ", ".join(parts) or normalize_text(value.get("raw")) or None
 
-# ========================= 单线路解析 =========================
-def parse_one_sheet(df, sheet_name, target_country, rules):
+
+def format_forbidden(value: Any) -> Optional[str]:
+    if isinstance(value, list):
+        return ", ".join(normalize_text(x) for x in value if normalize_text(x)) or None
+    return normalize_text(value) or None
+
+
+# ============================================================
+# 12. 解析单个线路Sheet
+# ============================================================
+def parse_one_sheet(df: pd.DataFrame, sheet_name: str, target_country: str, rules: pd.DataFrame):
     rows, errors = [], []
-    country_rule = rule(rules,"Destination Country")
-    weight_rule = rule(rules,"Weight Range (max kg)")
-    freight_rule = rule(rules,"RMB /kg")
-    parcel_rule = rule(rules,"RMB /parcel")
-    channel_id, cargo = extract_id(sheet_name), cargo_category(sheet_name)
     try:
-        header_row, country_col, country_rows = find_country_rows(df,country_rule,target_country)
+        country_rule = get_rule(rules, "Destination Country")
+        weight_rule = get_rule(rules, "Weight Range (max kg)")
+        freight_rule = get_rule(rules, "RMB /kg")
+        parcel_rule = get_rule(rules, "RMB /parcel")
+        channel_id = extract_id(sheet_name)
+        cargo = cargo_category(sheet_name)
+
+        _, _, country_rows = find_country_rows(df, country_rule, target_country)
+        if not country_rows:
+            return rows, errors
+
+        weight_col = find_cell(df, weight_rule["列定位类型"], weight_rule["列定位值"])
+        freight_col = find_cell(df, freight_rule["列定位类型"], freight_rule["列定位值"])
+        parcel_col = find_cell(df, parcel_rule["列定位类型"], parcel_rule["列定位值"])
+        if not weight_col or not freight_col or not parcel_col:
+            return rows, [{"Sheet": sheet_name, "Field": "Price Columns", "Error": "无法定位重量/运费/挂号费列"}]
+
+        weight_source_rows = []
+        country_context = []
+        for r in country_rows:
+            values = {f"Column_{c+1}": normalize_text(df.iat[r, c]) for c in range(df.shape[1]) if normalize_text(df.iat[r, c])}
+            country_context.append({"Excel Row": r + 1, "Values": values})
+            weight_raw = normalize_text(df.iat[r, weight_col[1]])
+            if weight_raw:
+                weight_source_rows.append({
+                    "source_excel_row": r + 1,
+                    "weight_range_raw": weight_raw,
+                    "freight_raw": normalize_text(df.iat[r, freight_col[1]]),
+                    "parcel_raw": normalize_text(df.iat[r, parcel_col[1]]),
+                })
+
+        if not weight_source_rows:
+            return rows, [{"Sheet": sheet_name, "Field": "Weight Range", "Error": "目标国家没有找到重量价格行"}]
+
+        metadata = ai_extract_metadata(
+            target_country,
+            json.dumps(country_context, ensure_ascii=False, indent=2),
+            extract_section(df, "价格使用说明"),
+            extract_section(df, "计重规则"),
+            extract_section(df, "申报及税费"),
+            rules,
+        )
+
+        weight_ai = ai_map_weight_rows(target_country, weight_source_rows, weight_rule)
+        source_min, source_max = safe_float(weight_ai.get("source_min_kg")), safe_float(weight_ai.get("source_max_kg"))
+        if source_min is None or source_max is None:
+            return rows, [{"Sheet": sheet_name, "Field": "Weight Range", "Error": "AI无法确定源数据最小/最大计费重量"}]
+
+        mapping = {}
+        for item in weight_ai.get("mapping", []):
+            mx = safe_float(item.get("target_max_kg"))
+            src = item.get("source_excel_row")
+            if mx is not None and src is not None:
+                try:
+                    mapping[round(mx, 2)] = int(src)
+                except (ValueError, TypeError):
+                    pass
+
+        weight_steps = generate_weight_steps(source_min, source_max)
+        pick_pack = safe_float(metadata.get("Pick&Packing/parcel"))
+        volume_param = safe_float(metadata.get("Volume to Weight parameter"))
+
+        for wmin, wmax in weight_steps:
+            source_row = mapping.get(round(wmax, 2))
+            if source_row is None:
+                errors.append({"Sheet": sheet_name, "Field": "Weight Range", "Weight max": wmax, "Error": "AI没有指定对应源价格行"})
+                continue
+
+            source_idx = source_row - 1
+            if source_idx not in country_rows:
+                errors.append({"Sheet": sheet_name, "Field": "Weight Range", "Weight max": wmax, "Error": f"AI指定Row {source_row}不属于目标国家"})
+                continue
+
+            rkg = safe_float(df.iat[source_idx, freight_col[1]])
+            rparcel = safe_float(df.iat[source_idx, parcel_col[1]])
+
+            # 如果价格Cell不是纯数字，再让AI只解析这个Cell，不让AI决定最终价格逻辑
+            if rkg is None:
+                ai_price = call_ai_json('只从这个Cell文本提取RMB/kg数字，返回{"value":null}，没有明确数字就返回null。', normalize_text(df.iat[source_idx, freight_col[1]]))
+                rkg = safe_float(ai_price.get("value"))
+            if rparcel is None:
+                ai_price = call_ai_json('只从这个Cell文本提取RMB/parcel数字，返回{"value":null}，没有明确数字就返回null。', normalize_text(df.iat[source_idx, parcel_col[1]]))
+                rparcel = safe_float(ai_price.get("value"))
+
+            total = None if any(v is None for v in [rkg, rparcel, pick_pack]) else round(wmax * rkg + rparcel + pick_pack, 2)
+
+            rows.append({
+                "ID": channel_id,
+                "Destination Country": target_country,
+                "Cargo Category": cargo,
+                "Cargo forbidden": format_forbidden(metadata.get("Cargo forbidden")),
+                "Time (workday/nature day)": format_time(metadata.get("Time")),
+                "Volume Limit (cm)": format_dimension(metadata.get("Volume Limit")),
+                "Volume to Weight parameter": volume_param,
+                "Weight Range (min kg)": wmin,
+                "Weight Range (max kg)": wmax,
+                "RMB /kg": rkg,
+                "RMB /parcel": rparcel,
+                "Pick&Packing/parcel": pick_pack,
+                "RMB in total": total,
+                "Tax Policy": format_tax(metadata.get("Tax Policy")),
+            })
+
     except Exception as e:
-        return rows,[{"Sheet":sheet_name,"Field":"Destination Country","Error":str(e)}]
-    if not country_rows: return rows, errors
+        errors.append({"Sheet": sheet_name, "Field": "Parser", "Error": str(e)})
 
-    time_rule = rule(rules,"Time (workday/nature day)")
-    volume_rule = rule(rules,"Volume Limit (cm)")
-    try:
-        time_pos = find_column(df,time_rule)
-    except Exception:
-        time_pos = None
-    try:
-        volume_pos = find_column(df,volume_rule)
-    except Exception:
-        volume_pos = None
-
-    time_cells, volume_cells = [], []
-    if time_pos:
-        for rr in country_rows:
-            value = norm(df.iat[rr,time_pos[1]])
-            if value: time_cells.append({"Excel Row":rr+1,"value":value})
-    if volume_pos:
-        for rr in country_rows:
-            value = norm(df.iat[rr,volume_pos[1]])
-            if value: volume_cells.append({"Excel Row":rr+1,"value":value})
-
-    weight_pos = find_column(df,weight_rule)
-    freight_pos = find_column(df,freight_rule)
-    parcel_pos = find_column(df,parcel_rule)
-    weight_col, freight_col, parcel_col = weight_pos[1], freight_pos[1], parcel_pos[1]
-
-    country_context, weight_source_rows = [], []
-    for rr in country_rows:
-        vals = {f"Column_{c+1}":norm(df.iat[rr,c]) for c in range(df.shape[1]) if norm(df.iat[rr,c])}
-        country_context.append({"Excel Row":rr+1,"Values":vals})
-        weight_raw = norm(df.iat[rr,weight_col])
-        if weight_raw: weight_source_rows.append({"source_excel_row":rr+1,"weight_range_raw":weight_raw,"freight_raw":norm(df.iat[rr,freight_col]),"parcel_raw":norm(df.iat[rr,parcel_col])})
-
-    try:
-        meta = ai_metadata(target_country,json.dumps(country_context,ensure_ascii=False),extract_section(df,"价格使用说明"),extract_section(df,"计重规则"),extract_section(df,"申报及税费"),json.dumps(time_cells,ensure_ascii=False),json.dumps(volume_cells,ensure_ascii=False),rules)
-        wm = ai_weight_map(target_country,weight_source_rows,weight_rule)
-    except Exception as e:
-        return rows,[{"Sheet":sheet_name,"Field":"AI","Error":str(e)}]
-
-    source_min, source_max = safe_float(wm.get("source_min_kg")), safe_float(wm.get("source_max_kg"))
-    if source_min is None or source_max is None: return rows,[{"Sheet":sheet_name,"Field":"Weight Range","Error":"AI无法确定源重量范围"}]
-    mapping = {}
-    for x in wm.get("mapping",[]):
-        mx, sr = safe_float(x.get("target_max_kg")), x.get("source_excel_row")
-        if mx is not None and sr is not None: mapping[round(mx,2)] = int(sr)
-    steps = generate_weights(source_min,source_max)
-    pick_pack_raw = meta.get("Pick&Packing/parcel")
-    valid_source_rows = {r+1 for r in country_rows}
-
-    for wmin,wmax in steps:
-        source_row = mapping.get(round(wmax,2))
-        if source_row is None:
-            errors.append({"Sheet":sheet_name,"Field":"Weight Range","Weight max":wmax,"Error":"AI没有指定对应源价格行"}); continue
-        if source_row not in valid_source_rows:
-            errors.append({"Sheet":sheet_name,"Field":"Weight Range","Weight max":wmax,"Error":f"AI指定的Excel Row {source_row}不属于目标国家"}); continue
-        rr = source_row-1
-        rkg, rparcel = safe_float(df.iat[rr,freight_col]), safe_float(df.iat[rr,parcel_col])
-        ppack = pick_pack_value(pick_pack_raw,wmax)
-        total = round(wmax*rkg+rparcel+ppack,2) if None not in [rkg,rparcel,ppack] else None
-        rows.append({
-            "ID":channel_id,"Destination Country":target_country,"Cargo Category":cargo,
-            "Cargo forbidden":format_forbidden(meta.get("Cargo forbidden")),
-            "Time (workday/nature day)":format_time(meta.get("Time")),
-            "Volume Limit (cm)":format_dimension(meta.get("Volume Limit")),
-            "Volume to Weight parameter":safe_float(meta.get("Volume to Weight parameter")),
-            "Weight Range (min kg)":wmin,"Weight Range (max kg)":wmax,
-            "RMB /kg":rkg,"RMB /parcel":rparcel,"Pick&Packing/parcel":ppack,
-            "RMB in total":total,"Tax Policy":format_tax(meta.get("Tax Policy"))
-        })
     return rows, errors
 
-# ========================= 总解析 =========================
-def parse_workbook(all_sheets,target_country,rules):
-    sheets = locate_sheets(all_sheets,rule(rules,"ID"))
-    if not sheets: raise ValueError("没有找到符合当前供应商 Mapping 的线路 Sheet。")
-    all_rows, errors = [], []
-    progress, status = st.progress(0), st.empty()
-    for i,sheet_name in enumerate(sheets,1):
-        status.markdown(f"**解析 [{i}/{len(sheets)}]** `{sheet_name}` → `{target_country}`")
-        try:
-            r,e = parse_one_sheet(all_sheets[sheet_name],sheet_name,target_country,rules); all_rows.extend(r); errors.extend(e)
-        except Exception as ex:
-            errors.append({"Sheet":sheet_name,"Field":"Parser","Error":str(ex)})
-        progress.progress(i/len(sheets))
-    progress.empty(); status.success("✅ 解析完成")
-    result, errdf = pd.DataFrame(all_rows), pd.DataFrame(errors)
-    if not result.empty: result = result.drop_duplicates(subset=PRIMARY_KEYS,keep="last").reset_index(drop=True)
-    return result, errdf
 
-# ========================= 历史数据 / 更新 =========================
-def get_country_ws(country):
-    sh = get_gsheet_client().open_by_key(DATA_SHEET_ID)
-    try: return sh.worksheet(country)
-    except gspread.exceptions.WorksheetNotFound: return sh.add_worksheet(title=country,rows="2000",cols="30")
+# ============================================================
+# 13. 解析整个Excel：只解析用户输入的目标国家
+# ============================================================
+def parse_workbook(all_sheets: Dict[str, pd.DataFrame], target_country: str, rules: pd.DataFrame):
+    id_rule = get_rule(rules, "ID")
+    target_sheets = locate_sheets(all_sheets, id_rule)
+    if not target_sheets:
+        raise RuntimeError("没有找到符合当前供应商Mapping的线路Sheet。")
 
-def compare_data(new_df,old_df):
-    if old_df.empty: return {"new":new_df.copy(),"updated":pd.DataFrame(),"unchanged":pd.DataFrame(),"final":new_df.copy()}
+    all_rows, all_errors = [], []
+    progress = st.progress(0)
+    status = st.empty()
+
+    for i, sheet_name in enumerate(target_sheets, 1):
+        status.markdown(f"**解析 [{i}/{len(target_sheets)}]** `{sheet_name}` → `{target_country}`")
+        rows, errors = parse_one_sheet(all_sheets[sheet_name], sheet_name, target_country, rules)
+        all_rows.extend(rows)
+        all_errors.extend(errors)
+        progress.progress(i / len(target_sheets))
+
+    progress.empty()
+    status.success("✅ 解析完成")
+
+    result = pd.DataFrame(all_rows)
+    errors = pd.DataFrame(all_errors)
+    if not result.empty:
+        result = result.drop_duplicates(subset=PRIMARY_KEYS, keep="last").reset_index(drop=True)
+    return result, errors
+
+
+# ============================================================
+# 14. 新旧数据比较
+# ============================================================
+def get_country_worksheet(country: str):
+    return get_google_worksheet(DATA_SHEET_ID, country, create=True)
+
+
+def compare_data(new_df: pd.DataFrame, old_df: pd.DataFrame):
+    if old_df.empty:
+        return {"new": new_df.copy(), "updated": pd.DataFrame(), "unchanged": pd.DataFrame(), "final": new_df.copy()}
+
     new, old = new_df.copy(), old_df.copy()
-    for c in PRIMARY_KEYS: new[c], old[c] = new.get(c,""), old.get(c,"")
-    new["_pk"] = new[PRIMARY_KEYS].astype(str).agg("|".join,axis=1)
-    old["_pk"] = old[PRIMARY_KEYS].astype(str).agg("|".join,axis=1)
-    old = old.drop_duplicates("_pk",keep="last"); old_map = old.set_index("_pk",drop=False)
-    nrows, urows, irows = [], [], []
-    for _,n in new.iterrows():
-        pk=n["_pk"]
-        if pk not in old_map.index: nrows.append(n.drop("_pk").to_dict()); continue
-        o=old_map.loc[pk]
-        changed=any(norm(n.get(c,""))!=norm(o.get(c,"")) for c in new.columns if c!="_pk" and c in old.columns)
-        (urows if changed else irows).append(n.drop("_pk").to_dict())
-    untouched=old[~old["_pk"].isin(new["_pk"])].drop(columns="_pk",errors="ignore")
-    final=pd.concat([untouched,pd.DataFrame(nrows),pd.DataFrame(urows),pd.DataFrame(irows)],ignore_index=True)
-    return {"new":pd.DataFrame(nrows),"updated":pd.DataFrame(urows),"unchanged":pd.DataFrame(irows),"final":final}
+    for c in PRIMARY_KEYS:
+        if c not in new.columns:
+            new[c] = ""
+        if c not in old.columns:
+            old[c] = ""
 
-def write_data(ws,df):
-    df=df.fillna(""); ws.clear(); ws.update([df.columns.tolist()]+df.astype(str).values.tolist(),range_name="A1"); return len(df)
+    new["_pk"] = new[PRIMARY_KEYS].astype(str).agg("|".join, axis=1)
+    old["_pk"] = old[PRIMARY_KEYS].astype(str).agg("|".join, axis=1)
+    old_map = old.set_index("_pk")
 
-# ========================= App =========================
-st.title("📦 物流报价规则解析器")
-st.caption("自动识别供应商 → 加载对应 Mapping → 指定国家 → Python + AI 提取 → 预览 → 更新")
+    new_rows, updated_rows, unchanged_rows = [], [], []
+    for _, n in new.iterrows():
+        pk = n["_pk"]
+        if pk not in old_map.index:
+            new_rows.append(n.drop("_pk").to_dict())
+            continue
+        o = old_map.loc[pk]
+        compare_cols = [c for c in new.columns if c != "_pk" and c in old.columns]
+        changed = any(normalize_text(n[c]) != normalize_text(o[c]) for c in compare_cols)
+        (updated_rows if changed else unchanged_rows).append(n.drop("_pk").to_dict())
+
+    # 新文件中没有出现的旧记录暂时保留；不会误删
+    untouched = old[~old["_pk"].isin(new["_pk"])].drop(columns="_pk", errors="ignore")
+    final = pd.concat([untouched, pd.DataFrame(new_rows), pd.DataFrame(updated_rows), pd.DataFrame(unchanged_rows)], ignore_index=True)
+
+    return {"new": pd.DataFrame(new_rows), "updated": pd.DataFrame(updated_rows), "unchanged": pd.DataFrame(unchanged_rows), "final": final}
+
+
+def write_data(ws, df: pd.DataFrame):
+    clean = df.fillna("")
+    ws.clear()
+    ws.update([clean.columns.tolist()] + clean.astype(str).values.tolist(), range_name="A1")
+    return len(clean)
+
+
+# ============================================================
+# 15. App界面
+# ============================================================
 st.subheader("① 上传报价表")
-uploaded_file=st.file_uploader("把供应商报价 Excel 拖到这里",type=["xlsx","xls"])
-st.subheader("② 输入目标国家/地区")
-target_country=st.text_input("目标国家/地区",placeholder="例如：墨西哥、美国、加拿大").strip()
-if uploaded_file: st.info(f"已选择文件：{uploaded_file.name}")
+uploaded_file = st.file_uploader("把供应商报价 Excel 拖到这里", type=["xlsx", "xls"])
 
-run=st.button("🚀 识别供应商并开始解析",type="primary",use_container_width=True,disabled=not uploaded_file or not target_country)
+st.subheader("② 输入目标国家/地区")
+target_country = st.text_input("目标国家/地区", placeholder="例如：墨西哥、美国、加拿大").strip()
+
+if uploaded_file:
+    st.info(f"已选择文件：{uploaded_file.name}（{uploaded_file.size / 1024 / 1024:.1f} MB）")
+
+run = st.button(
+    "🚀 识别供应商并开始解析",
+    type="primary",
+    use_container_width=True,
+    disabled=not uploaded_file or not target_country,
+)
+
 if run:
     try:
-        with st.spinner("正在读取 Excel 并识别供应商..."):
-            all_sheets=load_excel(uploaded_file.getvalue())
-            supplier_code,supplier_name,mapping_sheet=detect_supplier(all_sheets)
-            rules=load_mapping(mapping_sheet)
-        st.success(f"✅ 供应商：{supplier_name}（{supplier_code}）")
-        st.info(f"✅ Mapping：{mapping_sheet}；目标国家：{target_country}")
+        with st.spinner("正在读取Excel..."):
+            all_sheets = load_excel(uploaded_file.getvalue())
 
-        with st.spinner(f"正在解析【{target_country}】..."):
-            parsed_df,errors_df=parse_workbook(all_sheets,target_country,rules)
+        supplier_code, supplier_name, mapping_sheet = detect_supplier(all_sheets)
+        st.success(f"✅ 供应商：{supplier_name}（{supplier_code}）")
+        st.info(f"✅ Mapping：{mapping_sheet}")
+
+        rules = load_mapping(mapping_sheet)
+
+        with st.spinner(f"正在解析目标国家：{target_country}"):
+            parsed_df, errors_df = parse_workbook(all_sheets, target_country, rules)
+
         if parsed_df.empty:
             st.error(f"❌ 没有提取到【{target_country}】的数据。")
-            if not errors_df.empty: st.dataframe(errors_df,use_container_width=True)
+            if not errors_df.empty:
+                st.dataframe(errors_df, use_container_width=True)
             st.stop()
 
-        ws=get_country_ws(target_country); old_df=pd.DataFrame(ws.get_all_records()); comparison=compare_data(parsed_df,old_df)
-        c1,c2,c3,c4=st.columns(4); c1.metric("解析记录",len(parsed_df)); c2.metric("新增",len(comparison["new"])); c3.metric("更新",len(comparison["updated"])); c4.metric("异常",len(errors_df))
-        t1,t2,t3,t4=st.tabs(["全部结果","新增","更新","异常"])
-        with t1: st.dataframe(parsed_df,use_container_width=True,height=600)
-        with t2: st.dataframe(comparison["new"],use_container_width=True)
-        with t3: st.dataframe(comparison["updated"],use_container_width=True)
-        with t4:
-            if errors_df.empty: st.success("✅ 没有发现异常")
-            else: st.dataframe(errors_df,use_container_width=True)
-        st.download_button("⬇️ 下载解析结果 CSV",parsed_df.to_csv(index=False).encode("utf-8-sig"),file_name=f"{supplier_code}_{target_country}.csv",mime="text/csv")
+        ws = get_country_worksheet(target_country)
+        old_df = pd.DataFrame(ws.get_all_records())
+        comparison = compare_data(parsed_df, old_df)
 
-        st.warning(f"确认后将更新 Google Sheet【{target_country}】；唯一键：ID + Destination Country + Weight Range (max kg)。")
-        confirm=st.checkbox("我确认解析结果，执行更新")
-        if st.button("✅ 确认并更新 Google Sheet",type="primary",use_container_width=True,disabled=not confirm):
-            count=write_data(ws,comparison["final"]); st.success(f"🎉 更新完成，共 {count} 条记录。")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("解析记录", len(parsed_df))
+        c2.metric("新增", len(comparison["new"]))
+        c3.metric("更新", len(comparison["updated"]))
+        c4.metric("异常", len(errors_df))
+
+        tab1, tab2, tab3, tab4 = st.tabs(["全部结果", "新增", "更新", "异常"])
+        with tab1:
+            st.dataframe(parsed_df, use_container_width=True, height=600)
+        with tab2:
+            st.dataframe(comparison["new"], use_container_width=True)
+        with tab3:
+            st.dataframe(comparison["updated"], use_container_width=True)
+        with tab4:
+            st.dataframe(errors_df, use_container_width=True)
+
+        st.download_button(
+            "⬇️ 下载解析结果 CSV",
+            parsed_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{supplier_code}_{target_country}.csv",
+            mime="text/csv",
+        )
+
+        st.warning(f"确认后更新Google Sheet【{target_country}】；唯一键：ID + Destination Country + Weight Range (max kg)。")
+
+        confirm = st.checkbox("我已检查预览结果，确认写入Google Sheet。")
+        if st.button("✅ 确认并更新 Google Sheet", type="primary", use_container_width=True, disabled=not confirm):
+            count = write_data(ws, comparison["final"])
+            st.success(f"🎉 更新完成，共 {count} 条记录。")
+
     except Exception as e:
         st.error("❌ 运行失败")
         st.exception(e)
