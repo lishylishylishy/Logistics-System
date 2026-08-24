@@ -93,7 +93,8 @@ def detect_supplier(workbook):
 # ============================================================
 @st.cache_data(show_spinner=False)
 def load_excel(file_bytes):
-    return pd.read_excel(file_bytes, sheet_name=None, header=None)
+    import io
+    return pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=None)
 
 
 def norm(v):
