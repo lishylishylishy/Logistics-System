@@ -586,5 +586,6 @@ if st.button("🚀 识别供应商并开始解析", type="primary", use_containe
             count = write_data(ws, comparison["final"])
             st.success(f"🎉 更新完成，共 {count} 条记录。")
 
-    except Exception as e:
-        st.error(f"❌ 运行失败：{e}")
+except Exception as e:
+    st.error("❌ 运行失败")
+    st.exception(e)
