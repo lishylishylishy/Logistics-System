@@ -23,13 +23,14 @@ GCP_JSON = st.secrets["gcp_json"]                 # Google Service Account JSON
 AI_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 AI_MODEL = "qwen3.7-plus"
 
-PRIMARY_KEYS = ["ID", "Destination Country", "Weight (kg)"]
+PRIMARY_KEYS = ["ID", "Destination Country", "Supplier", "Weight (kg)"]
 
 STANDARD_FIELDS = [
-    "ID", "Destination Country", "Cargo Category", "Cargo forbidden",
-    "Time (workday/nature day)", "Volume Limit (cm)", "Volume to Weight Parameter",
+    "ID", "Destination Country", "Supplier", "Cargo Category", "Cargo forbidden",
+    "Time Min (day)", "Time Max (day)", "Time Type (workday/nature day)",
+    "Volume Limit (cm)", "Volume to Weight Parameter",
     "Weight (kg)", "RMB /kg", "RMB /parcel",
-    "Pick&Packing/parcel", "RMB in total", "Tax Policy",
+    "Pick&Packing/parcel", "RMB in total", "DDP", "Tax Policy",
 ]
 
 
@@ -84,6 +85,12 @@ def json_params(rule: Dict[str, Any]) -> Dict[str, Any]:
         return value
     except Exception as e:
         raise RuntimeError(f"字段【{rule.get('字段')}】的Python规则参数不是合法JSON：{e}") from e
+
+
+st.markdown(
+    f"[规则库（Google Sheets）](https://docs.google.com/spreadsheets/d/{spreadsheet_key(RULE_SHEET_ID)}) ｜ "
+    f"[目标数据表（Google Sheets）](https://docs.google.com/spreadsheets/d/{spreadsheet_key(DATA_SHEET_ID)})"
+)
 
 
 # ============================================================
@@ -412,6 +419,12 @@ def parser_sheet_name_regex_group(sheet_name: str, rule: Dict[str, Any]) -> Opti
     return match.group(group).strip() if match and len(match.groups()) >= group else None
 
 
+@register_parser("parser_mapping_tab_name")
+def parser_mapping_tab_name(value: Any, rule: Dict[str, Any]) -> Optional[str]:
+    # 供应商名=规则库Mapping的tab名，由引擎传入
+    return norm(value) or None
+
+
 @register_parser("parser_sheet_keyword_map")
 def parser_sheet_keyword_map(sheet_name: str, rule: Dict[str, Any]) -> Optional[str]:
     params = json_params(rule)
@@ -550,8 +563,8 @@ def ai_json(prompt: str, context: str) -> Dict[str, Any]:
 
 def ai_metadata(target_country: str, country_context: str, notes: Dict[str, str], rules: pd.DataFrame) -> Dict[str, Any]:
     fields = [
-        "Cargo forbidden", "Time (workday/nature day)", "Volume Limit (cm)",
-        "Volume to Weight Parameter", "Pick&Packing/parcel", "Tax Policy",
+        "Cargo forbidden", "Time Min (day)", "Time Max (day)", "Time Type (workday/nature day)",
+        "Volume Limit (cm)", "Volume to Weight Parameter", "Pick&Packing/parcel", "DDP", "Tax Policy",
     ]
 
     instructions = []
@@ -570,15 +583,17 @@ def ai_metadata(target_country: str, country_context: str, notes: Dict[str, str]
 严格返回JSON：
 {{
   "Cargo forbidden": [],
-  "Time": {{"min": null, "max": null, "unit": null}},
+  "Time": {{"min": null, "max": null, "unit": null, "risk_note": null}},
   "Volume Limit": {{"length_cm": null, "width_cm": null, "height_cm": null, "max_length_cm": null, "max_volume_m3": null, "formula": null, "raw": null}},
   "Volume to Weight Parameter": null,
   "Pick&Packing/parcel": "unknown",
+  "DDP": "unknown",
   "Tax Policy": {{"delivery_term": null, "fob_limit_usd": null, "cif_limit_usd": null, "raw": null}}
 }}
 
 要求：
-- Time严格按照Mapping中的AI指令返回单位。
+- Time.min/Time.max只输出数字，单一值时两者相同；unit只能是workday或nature day；risk_note为延误风险提示原文，没有则null。
+- DDP只能是yes/no/unknown。
 - Pick&Packing不能确认费用时必须返回"unknown"。
 - 不得猜测。
 """
@@ -594,18 +609,6 @@ def ai_metadata(target_country: str, country_context: str, notes: Dict[str, str]
 # ============================================================
 # ⑩ AI结果格式化
 # ============================================================
-def format_time(value: Any) -> Optional[str]:
-    if not value:
-        return None
-    if isinstance(value, dict):
-        mn, mx, unit = value.get("min"), value.get("max"), value.get("unit")
-        if mn is None:
-            return None
-        unit = unit or "workday"
-        return f"{mn} {unit}" if mx is None or mn == mx else f"{mn}~{mx} {unit}"
-    return norm(value) or None
-
-
 def format_dimension(value: Any) -> Optional[str]:
     if not value:
         return None
@@ -660,14 +663,15 @@ def format_volume_weight(value: Any) -> Optional[str]:
 # ============================================================
 # ⑪ 单条线路解析主流程（通用引擎，专用规则全部来自Mapping）
 # ============================================================
-def parse_route(df: pd.DataFrame, sheet_name: str, target_country: str, rules: pd.DataFrame) -> Dict[str, Any]:
+def parse_route(df: pd.DataFrame, sheet_name: str, target_country: str, rules: pd.DataFrame, supplier: str) -> Dict[str, Any]:
     route: Dict[str, Any] = {"sheet": sheet_name, "country": target_country, "errors": []}
 
-    # 线路粒度字段：ID、Cargo Category（从sheet名解析）
-    for field in ["ID", "Cargo Category"]:
+    # 线路/供应商粒度字段：ID、Cargo Category从sheet名解析，Supplier=Mapping tab名
+    for field in ["ID", "Cargo Category", "Supplier"]:
         rule = get_rule(rules, field)
+        source = sheet_name if norm(rule["原始提取类型"]) == "sheet_name" else supplier
         try:
-            route[field] = run_parser(rule, sheet_name)
+            route[field] = run_parser(rule, source)
         except Exception as e:
             route[field] = None
             route["errors"].append(f"{field}: {e}")
@@ -690,19 +694,23 @@ def parse_route(df: pd.DataFrame, sheet_name: str, target_country: str, rules: p
         for r in crows
     )
 
-    # 国家粒度、列定位字段：Time、Volume Limit（先取原始文本，供AI上下文与兜底）
-    for field in ["Time (workday/nature day)", "Volume Limit (cm)"]:
-        rule = get_rule(rules, field)
-        try:
-            col = locate_column(df, rule)
-            route[f"{field}_raw"] = " | ".join(dict.fromkeys(norm(df.iat[r, col]) for r in crows if norm(df.iat[r, col])))
-        except Exception as e:
-            route[f"{field}_raw"] = ""
-            route["errors"].append(f"{field}: {e}")
+    # 国家粒度、列定位字段：时效/尺寸原始文本（供AI上下文与兜底）
+    try:
+        col = locate_column(df, get_rule(rules, "Time Min (day)"))
+        route["Time_raw"] = " | ".join(dict.fromkeys(norm(df.iat[r, col]) for r in crows if norm(df.iat[r, col])))
+    except Exception as e:
+        route["Time_raw"] = ""
+        route["errors"].append(f"Time: {e}")
+    try:
+        col = locate_column(df, get_rule(rules, "Volume Limit (cm)"))
+        route["Volume Limit (cm)_raw"] = " | ".join(dict.fromkeys(norm(df.iat[r, col]) for r in crows if norm(df.iat[r, col])))
+    except Exception as e:
+        route["Volume Limit (cm)_raw"] = ""
+        route["errors"].append(f"Volume Limit (cm): {e}")
 
     # 章节文本字段（供AI，锚点来自Mapping行定位值）
     notes = {}
-    for field in ["Cargo forbidden", "Volume to Weight Parameter", "Pick&Packing/parcel", "Tax Policy"]:
+    for field in ["Cargo forbidden", "Volume to Weight Parameter", "Pick&Packing/parcel", "DDP", "Tax Policy"]:
         rule = get_rule(rules, field)
         if norm(rule["行定位类型"]) in {"text_anchor", "header_text"}:
             notes[field] = extract_section(df, norm(rule["行定位值"]))
@@ -740,10 +748,31 @@ def parse_route(df: pd.DataFrame, sheet_name: str, target_country: str, rules: p
 
     pick_pack = meta.get("Pick&Packing/parcel")
     route["Cargo forbidden"] = format_forbidden(meta.get("Cargo forbidden"))
-    route["Time (workday/nature day)"] = format_time(meta.get("Time")) or route.get("Time (workday/nature day)_raw") or None
+
+    # 时效拆三列：最小天数/最大天数/类型与延误风险；AI失败时用原始文本兜底
+    t = meta.get("Time")
+    t = t if isinstance(t, dict) else {}
+    t_min, t_max, unit, risk = t.get("min"), t.get("max"), t.get("unit"), t.get("risk_note")
+    raw_time = norm(route.get("Time_raw"))
+    if t_min is None and raw_time:
+        m = re.search(r"(\d+(?:\.\d+)?)\s*[-~]\s*(\d+(?:\.\d+)?)", raw_time)
+        if m:
+            t_min, t_max = float(m.group(1)), float(m.group(2))
+        else:
+            m2 = re.search(r"\d+(?:\.\d+)?", raw_time)
+            t_min = float(m2.group()) if m2 else None
+        if not unit:
+            unit = "nature day" if "自然日" in raw_time else "workday"
+        if not risk and "延误" in raw_time:
+            risk = raw_time
+    route["Time Min (day)"] = t_min
+    route["Time Max (day)"] = t_max if t_max is not None else t_min
+    route["Time Type (workday/nature day)"] = "; ".join(str(x) for x in [unit or "workday", risk] if norm(x)) or None
+
     route["Volume Limit (cm)"] = format_dimension(meta.get("Volume Limit")) or route.get("Volume Limit (cm)_raw") or None
     route["Volume to Weight Parameter"] = format_volume_weight(meta.get("Volume to Weight Parameter"))
     route["Pick&Packing/parcel"] = pick_pack if pick_pack not in {None, ""} else "unknown"
+    route["DDP"] = meta.get("DDP") or "unknown"
     route["Tax Policy"] = format_tax(meta.get("Tax Policy"))
 
     # Weight (kg) 梯度展开：0.25递增、不超过最大计费重量，每点继承所在源重量段价格
@@ -796,7 +825,7 @@ if uploaded is not None:
             results = []
             for sheet_name in route_sheets:
                 with st.spinner(f"解析 {sheet_name} ..."):
-                    route = parse_route(all_sheets[sheet_name], sheet_name, target_country, rules)
+                    route = parse_route(all_sheets[sheet_name], sheet_name, target_country, rules, supplier)
                 results.append(route)
 
             ok_routes = [r for r in results if r.get("weight_records")]
@@ -823,21 +852,35 @@ if uploaded is not None:
                 ws = get_country_worksheet(target_country)
 
                 new_rows = []
+
+                def fmt_num(x: Any) -> str:
+                    if x is None or x == "":
+                        return ""
+                    try:
+                        f = float(x)
+                        return str(int(f)) if f == int(f) else str(f)
+                    except (TypeError, ValueError):
+                        return norm(x)
+
                 for route in ok_routes:
                     for rec in route["weight_records"]:
                         new_rows.append([
                             norm(route.get("ID")),
                             target_country,
+                            norm(route.get("Supplier")),
                             norm(route.get("Cargo Category")),
                             norm(route.get("Cargo forbidden")),
-                            norm(route.get("Time (workday/nature day)")),
+                            fmt_num(route.get("Time Min (day)")),
+                            fmt_num(route.get("Time Max (day)")),
+                            norm(route.get("Time Type (workday/nature day)")),
                             norm(route.get("Volume Limit (cm)")),
                             norm(route.get("Volume to Weight Parameter")),
-                            str(rec["Weight (kg)"]),
-                            str(rec["RMB /kg"]) if rec["RMB /kg"] is not None else "",
-                            str(rec["RMB /parcel"]) if rec["RMB /parcel"] is not None else "",
+                            fmt_num(rec["Weight (kg)"]),
+                            fmt_num(rec["RMB /kg"]),
+                            fmt_num(rec["RMB /parcel"]),
                             norm(route.get("Pick&Packing/parcel")),
-                            str(rec["RMB in total"]) if rec["RMB in total"] is not None else "",
+                            fmt_num(rec["RMB in total"]),
+                            norm(route.get("DDP")),
                             norm(route.get("Tax Policy")),
                         ])
 
@@ -846,6 +889,10 @@ if uploaded is not None:
                 if not existing:
                     ws.append_row(STANDARD_FIELDS, value_input_option="RAW")
                     existing = [list(STANDARD_FIELDS)]
+                elif norm(existing[0][0]) != "ID":
+                    # 有数据但无表头：自动插入表头行
+                    ws.insert_row([str(x) for x in STANDARD_FIELDS], 1, value_input_option="RAW")
+                    existing = [list(STANDARD_FIELDS)] + existing
                 header = [norm(x) for x in existing[0]]
 
                 updates, appends = [], []
@@ -858,7 +905,7 @@ if uploaded is not None:
                     for values in new_rows:
                         key = tuple(values[header.index(k)] for k in PRIMARY_KEYS)
                         if key in old:
-                            updates.append({"range": f"A{old[key]}:M{old[key]}", "values": [values]})
+                            updates.append({"range": f"A{old[key]}:Q{old[key]}", "values": [values]})
                         else:
                             old[key] = -1
                             appends.append(values)
