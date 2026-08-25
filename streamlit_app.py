@@ -851,8 +851,6 @@ if uploaded is not None:
             if ok_routes and st.button("写入目标数据表（Google Sheets）"):
                 ws = get_country_worksheet(target_country)
 
-                new_rows = []
-
                 def fmt_num(x: Any) -> str:
                     if x is None or x == "":
                         return ""
@@ -862,61 +860,99 @@ if uploaded is not None:
                     except (TypeError, ValueError):
                         return norm(x)
 
-                for route in ok_routes:
-                    for rec in route["weight_records"]:
-                        new_rows.append([
-                            norm(route.get("ID")),
-                            target_country,
-                            norm(route.get("Supplier")),
-                            norm(route.get("Cargo Category")),
-                            norm(route.get("Cargo forbidden")),
-                            fmt_num(route.get("Time Min (day)")),
-                            fmt_num(route.get("Time Max (day)")),
-                            norm(route.get("Time Type (workday/nature day)")),
-                            norm(route.get("Volume Limit (cm)")),
-                            norm(route.get("Volume to Weight Parameter")),
-                            fmt_num(rec["Weight (kg)"]),
-                            fmt_num(rec["RMB /kg"]),
-                            fmt_num(rec["RMB /parcel"]),
-                            norm(route.get("Pick&Packing/parcel")),
-                            fmt_num(rec["RMB in total"]),
-                            norm(route.get("DDP")),
-                            norm(route.get("Tax Policy")),
-                        ])
-
                 # 批量写入+主键去重：避免逐行append触发Google写配额(429)，重跑不产生重复行
-                existing = ws.get_all_values()
-                if not existing:
+                raw = ws.get_all_values()
+                # 过滤全空行并记录真实行号（兼容首行空行/gspread空行填充）
+                numbered = [(idx, row) for idx, row in enumerate(raw, start=1) if any(norm(x) for x in row)]
+
+                def col_letter(n: int) -> str:
+                    s = ""
+                    while n:
+                        n, r = divmod(n - 1, 26)
+                        s = chr(65 + r) + s
+                    return s
+
+                if not numbered:
                     ws.append_row(STANDARD_FIELDS, value_input_option="RAW")
-                    existing = [list(STANDARD_FIELDS)]
-                elif norm(existing[0][0]) != "ID":
-                    # 有数据但无表头：自动插入表头行
-                    ws.insert_row([str(x) for x in STANDARD_FIELDS], 1, value_input_option="RAW")
-                    existing = [list(STANDARD_FIELDS)] + existing
-                header = [norm(x) for x in existing[0]]
+                    final_header = [str(x) for x in STANDARD_FIELDS]
+                    data_rows: List[Tuple[int, List[str]]] = []
+                else:
+                    first_no, first_row = numbered[0]
+                    first_names = [norm(x) for x in first_row]
+                    is_header = first_no == 1 and sum(1 for k in PRIMARY_KEYS if k in first_names) >= len(PRIMARY_KEYS) - 1
+                    if is_header:
+                        final_header = first_names
+                        data_rows = numbered[1:]
+                        # 表头自动补齐：缺失的标准列名补到行末
+                        missing = [f for f in STANDARD_FIELDS if f not in final_header]
+                        if missing:
+                            a = len(final_header) + 1
+                            ws.update(f"{col_letter(a)}1:{col_letter(a + len(missing) - 1)}1", [missing], value_input_option="RAW")
+                            final_header = final_header + missing
+                    else:
+                        # 无表头：插入标准表头行，数据行号整体+1
+                        ws.insert_row([str(x) for x in STANDARD_FIELDS], 1, value_input_option="RAW")
+                        final_header = [str(x) for x in STANDARD_FIELDS]
+                        data_rows = [(no + 1, row) for no, row in numbered]
+
+                # 列数据与表头名绑定：按表头位置写入，用户移动列不影响正确性
+                pos = {name: i for i, name in enumerate(final_header)}
+                ncols = len(final_header)
+                std_cols = sorted(pos[f] for f in STANDARD_FIELDS)
+                runs: List[List[int]] = []
+                for c in std_cols:
+                    if runs and c == runs[-1][1] + 1:
+                        runs[-1][1] = c
+                    else:
+                        runs.append([c, c])
 
                 updates, appends = [], []
-                if all(k in header for k in PRIMARY_KEYS):
-                    kidx = [header.index(k) for k in PRIMARY_KEYS]
+                if all(k in pos for k in PRIMARY_KEYS):
                     old = {}
-                    for i, row in enumerate(existing[1:], start=2):
-                        key = tuple(norm(row[j]) if j < len(row) else "" for j in kidx)
-                        old.setdefault(key, i)
-                    for values in new_rows:
-                        key = tuple(values[header.index(k)] for k in PRIMARY_KEYS)
-                        if key in old:
-                            updates.append({"range": f"A{old[key]}:Q{old[key]}", "values": [values]})
-                        else:
-                            old[key] = -1
-                            appends.append(values)
-                else:
-                    appends = new_rows
+                    for no, row in data_rows:
+                        key = tuple(norm(row[pos[k]]) if pos[k] < len(row) else "" for k in PRIMARY_KEYS)
+                        old.setdefault(key, no)
+                    for route in ok_routes:
+                        for rec in route["weight_records"]:
+                            rec_dict = {
+                                "ID": norm(route.get("ID")),
+                                "Destination Country": target_country,
+                                "Supplier": norm(route.get("Supplier")),
+                                "Cargo Category": norm(route.get("Cargo Category")),
+                                "Cargo forbidden": norm(route.get("Cargo forbidden")),
+                                "Time Min (day)": fmt_num(route.get("Time Min (day)")),
+                                "Time Max (day)": fmt_num(route.get("Time Max (day)")),
+                                "Time Type (workday/nature day)": norm(route.get("Time Type (workday/nature day)")),
+                                "Volume Limit (cm)": norm(route.get("Volume Limit (cm)")),
+                                "Volume to Weight Parameter": norm(route.get("Volume to Weight Parameter")),
+                                "Weight (kg)": fmt_num(rec["Weight (kg)"]),
+                                "RMB /kg": fmt_num(rec["RMB /kg"]),
+                                "RMB /parcel": fmt_num(rec["RMB /parcel"]),
+                                "Pick&Packing/parcel": norm(route.get("Pick&Packing/parcel")),
+                                "RMB in total": fmt_num(rec["RMB in total"]),
+                                "DDP": norm(route.get("DDP")),
+                                "Tax Policy": norm(route.get("Tax Policy")),
+                            }
+                            row_values = [""] * ncols
+                            for f in STANDARD_FIELDS:
+                                row_values[pos[f]] = rec_dict[f]
+                            key = tuple(rec_dict[k] for k in PRIMARY_KEYS)
+                            if key in old:
+                                no = old[key]
+                                for a, b in runs:
+                                    updates.append({
+                                        "range": f"{col_letter(a + 1)}{no}:{col_letter(b + 1)}{no}",
+                                        "values": [row_values[a:b + 1]],
+                                    })
+                            else:
+                                old[key] = -1
+                                appends.append(row_values)
 
                 if updates:
                     ws.batch_update(updates, value_input_option="RAW")
                 for i in range(0, len(appends), 1000):
                     ws.append_rows(appends[i:i + 1000], value_input_option="RAW")
-                st.success(f"写入完成：更新{len(updates)}行、新增{len(appends)}行（共{len(new_rows)}行）")
+                st.success(f"写入完成：更新{len(updates)}行、新增{len(appends)}行（共{len(updates) + len(appends)}行）")
 
     except Exception as e:
         st.error(str(e))
