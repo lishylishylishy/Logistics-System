@@ -10,7 +10,6 @@ import streamlit as st
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-
 # ============================================================
 # ① 固定配置：这里才放真正"通用"的系统配置
 # ============================================================
@@ -23,22 +22,14 @@ GCP_JSON = st.secrets["gcp_json"]                 # Google Service Account JSON
 AI_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 AI_MODEL = "qwen3.7-plus"
 
-PRIMARY_KEYS = ["ID", "Destination Country", "Weight Range (max kg)"]
-
-# 通用业务规则：0~3kg，每0.25kg一个梯度
-STANDARD_WEIGHTS = [
-    (0.00, 0.25), (0.25, 0.50), (0.50, 0.75), (0.75, 1.00),
-    (1.00, 1.25), (1.25, 1.50), (1.50, 1.75), (1.75, 2.00),
-    (2.00, 2.25), (2.25, 2.50), (2.50, 2.75), (2.75, 3.00),
-]
+PRIMARY_KEYS = ["ID", "Destination Country", "Weight (kg)"]
 
 STANDARD_FIELDS = [
     "ID", "Destination Country", "Cargo Category", "Cargo forbidden",
-    "Time (workday/nature day)", "Volume Limit (cm)", "Volume to Weight parameter",
-    "Weight Range (min kg)", "Weight Range (max kg)", "RMB /kg", "RMB /parcel",
+    "Time (workday/nature day)", "Volume Limit (cm)", "Volume to Weight Parameter",
+    "Weight (kg)", "RMB /kg", "RMB /parcel",
     "Pick&Packing/parcel", "RMB in total", "Tax Policy",
 ]
-
 
 # ============================================================
 # ② 页面
@@ -309,8 +300,16 @@ def locate_column(df: pd.DataFrame, rule: Dict[str, Any]) -> int:
     return hit[1]
 
 
-def find_section_start(df: pd.DataFrame) -> int:
-    anchors = ["价格使用说明", "计重规则", "申报及税费"]
+def mapping_section_anchors(rules: pd.DataFrame) -> List[str]:
+    # 章节锚点全部来自Mapping的行定位值（text_anchor），py不硬编码任何供应商章节名
+    anchors = []
+    for _, row in rules.iterrows():
+        if norm(row.get("行定位类型")) == "text_anchor":
+            anchors.extend(a for a in norm(row.get("行定位值")).split("|") if a)
+    return list(dict.fromkeys(anchors))
+
+
+def find_section_start(df: pd.DataFrame, anchors: List[str]) -> int:
     for r in range(len(df)):
         text = " ".join(norm(v) for v in df.iloc[r].tolist() if norm(v))
         if any(a in text for a in anchors):
@@ -322,11 +321,11 @@ def row_has_data(df: pd.DataFrame, r: int) -> bool:
     return any(norm(v) for v in df.iloc[r].tolist())
 
 
-def find_country_rows(df: pd.DataFrame, country_rule: Dict[str, Any], target_country: str) -> List[int]:
+def find_country_rows(df: pd.DataFrame, country_rule: Dict[str, Any], target_country: str, anchors: List[str]) -> List[int]:
     country_col = locate_column(df, country_rule)
     header_hit = locate_header_cell(df, country_rule)
     header_row = header_hit[0] if header_hit else 0
-    end_row = find_section_start(df)
+    end_row = find_section_start(df, anchors)
     target = norm(target_country)
 
     # BUG修复：原代码会把国家名之后的空行也计入（国家名向下延续），导致后续取数取到NaN
@@ -409,21 +408,37 @@ def parse_number(value: Any, rule: Dict[str, Any]) -> Optional[float]:
     return safe_float(value)
 
 
-@register_parser("parse_weight_bound")
-def parse_weight_bound(value: Any, rule: Dict[str, Any]) -> Optional[float]:
-    # 规则表参数示例：{"pattern": "([\\d.]+)\\s*[<＜]\\s*W\\s*[≤<=]+\\s*([\\d.]+)", "group": 1}
+@register_parser("parse_weight_segment")
+def parse_weight_segment(value: Any, rule: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    # 规则表参数示例：{"pattern": "([\\d.]+)\\s*[<＜]\\s*W\\s*[≤<=]+\\s*([\\d.]+)"}
     params = json_params(rule)
     pattern = params.get("pattern")
     if not pattern:
-        raise RuntimeError(f"字段【{rule.get('字段')}】的parse_weight_bound缺少pattern参数")
+        raise RuntimeError(f"字段【{rule.get('字段')}】的parse_weight_segment缺少pattern参数")
     try:
         m = re.search(pattern, norm(value))
     except re.error as e:
-        raise RuntimeError(f"字段【{rule.get('字段')}】的parse_weight_bound正则错误：{pattern}；{e}") from e
-    if not m:
+        raise RuntimeError(f"字段【{rule.get('字段')}】的parse_weight_segment正则错误：{pattern}；{e}") from e
+    if not m or len(m.groups()) < 2:
         return None
-    group = int(params.get("group", 1))
-    return float(m.group(group)) if len(m.groups()) >= group and m.group(group) else None
+    return float(m.group(1)), float(m.group(2))
+
+
+@register_parser("generate_weight_ladder")
+def generate_weight_ladder(source_max: Optional[float], rule: Dict[str, Any]) -> List[float]:
+    # 规则表参数示例：{"step_kg": 0.25, "ladder_max_kg": 3.0}
+    # 梯度点不得大于该ID+国家的最大计费重量（源重量段并集上界）
+    if source_max is None:
+        return []
+    params = json_params(rule)
+    step = float(params.get("step_kg", 0.25))
+    ladder_max = float(params.get("ladder_max_kg", 3.0))
+    cap = min(ladder_max, source_max)
+    ladder, w = [], step
+    while w <= cap + 1e-9:
+        ladder.append(round(w, 2))
+        w += step
+    return ladder
 
 
 def run_parser(rule: Dict[str, Any], *args) -> Any:
@@ -435,26 +450,11 @@ def run_parser(rule: Dict[str, Any], *args) -> Any:
     return PARSERS[name](*args, rule)
 
 
-def generate_standard_weight_ranges(source_min: float, source_max: float) -> List[Tuple[float, float]]:
-    if source_min is None or source_max is None or source_min >= source_max:
-        return []
-
-    result = []
-    for smin, smax in STANDARD_WEIGHTS:
-        if smax <= source_min or smin >= source_max:
-            continue
-        wmin = max(smin, source_min)
-        wmax = min(smax, source_max)
-        if wmax > wmin:
-            result.append((round(wmin, 2), round(wmax, 2)))
-    return result
+ALLOWED_FORMULA_VARS = {"weight", "rmb_kg", "rmb_parcel", "pick_pack_calc"}
 
 
-ALLOWED_FORMULA_VARS = {"max_weight", "rmb_kg", "rmb_parcel", "pick_pack_calc"}
-
-
-def calculate_total_by_mapping(rule: Dict[str, Any], max_weight: float, rmb_kg: Optional[float], rmb_parcel: Optional[float], pick_pack_display: Any) -> Optional[float]:
-    if rmb_kg is None or rmb_parcel is None or max_weight is None:
+def calculate_total_by_mapping(rule: Dict[str, Any], weight: float, rmb_kg: Optional[float], rmb_parcel: Optional[float], pick_pack_display: Any) -> Optional[float]:
+    if rmb_kg is None or rmb_parcel is None or weight is None:
         return None
 
     pick_pack_calc = safe_float(pick_pack_display)
@@ -464,10 +464,10 @@ def calculate_total_by_mapping(rule: Dict[str, Any], max_weight: float, rmb_kg: 
     expression = norm(params.get("formula"))
 
     if not expression:
-        return round(max_weight * rmb_kg + rmb_parcel + pick_pack_calc, 2)
+        return round(weight * rmb_kg + rmb_parcel + pick_pack_calc, 2)
 
     values = {
-        "max_weight": max_weight,
+        "weight": weight,
         "rmb_kg": rmb_kg,
         "rmb_parcel": rmb_parcel,
         "pick_pack_calc": pick_pack_calc,
@@ -530,7 +530,7 @@ def ai_json(prompt: str, context: str) -> Dict[str, Any]:
 def ai_metadata(target_country: str, country_context: str, notes: Dict[str, str], rules: pd.DataFrame) -> Dict[str, Any]:
     fields = [
         "Cargo forbidden", "Time (workday/nature day)", "Volume Limit (cm)",
-        "Volume to Weight parameter", "Pick&Packing/parcel", "Tax Policy",
+        "Volume to Weight Parameter", "Pick&Packing/parcel", "Tax Policy",
     ]
 
     instructions = []
@@ -551,7 +551,7 @@ def ai_metadata(target_country: str, country_context: str, notes: Dict[str, str]
   "Cargo forbidden": [],
   "Time": {{"min": null, "max": null, "unit": null}},
   "Volume Limit": {{"length_cm": null, "width_cm": null, "height_cm": null, "max_length_cm": null, "max_volume_m3": null, "formula": null, "raw": null}},
-  "Volume to Weight parameter": null,
+  "Volume to Weight Parameter": null,
   "Pick&Packing/parcel": "unknown",
   "Tax Policy": {{"delivery_term": null, "fob_limit_usd": null, "cif_limit_usd": null, "raw": null}}
 }}
@@ -562,43 +562,12 @@ def ai_metadata(target_country: str, country_context: str, notes: Dict[str, str]
 - 不得猜测。
 """
 
-    context = (
-        f"目标国家价格/服务行：\n{country_context}\n\n"
-        f"价格使用说明：\n{notes.get('价格使用说明', '')}\n\n"
-        f"计重规则：\n{notes.get('计重规则', '')}\n\n"
-        f"申报及税费：\n{notes.get('申报及税费', '')}"
-    )
+    context = f"目标国家价格/服务行：\n{country_context}\n\n"
+    for field, text in notes.items():
+        if norm(text):
+            context += f"{field} 相关章节：\n{text}\n\n"
 
     return ai_json(prompt, context)
-
-
-def ai_weight_rows(target_country: str, weight_rows: List[Dict[str, Any]], rule: Dict[str, Any]) -> Dict[str, Any]:
-    prompt = f"""
-目标国家：{target_country}
-分析下面真实存在的Excel重量价格行。
-
-{norm(rule["AI指令"])}
-
-标准target_max_kg只能是：
-0.25、0.50、0.75、1.00、1.25、1.50、1.75、2.00、2.25、2.50、2.75、3.00。
-
-严格返回：
-{{
-  "source_min_kg": null,
-  "source_max_kg": null,
-  "mapping": [
-    {{"target_max_kg":0.25,"source_excel_row":12}}
-  ]
-}}
-
-要求：
-1. source_excel_row必须来自输入中的真实Excel Row。
-2. target_max_kg选择能够覆盖该重量的源重量区间。
-3. 超过source_max_kg的target_max_kg返回null。
-4. 不得创造行号。
-"""
-
-    return ai_json(prompt, json.dumps(weight_rows, ensure_ascii=False, indent=2))
 
 
 # ============================================================
@@ -682,10 +651,11 @@ def parse_route(df: pd.DataFrame, sheet_name: str, target_country: str, rules: p
             route[field] = None
             route["errors"].append(f"{field}: {e}")
 
-    # 国家数据行
+    # 国家数据行（章节锚点来自Mapping）
     country_rule = get_rule(rules, "Destination Country")
+    anchors = mapping_section_anchors(rules)
     try:
-        crows = find_country_rows(df, country_rule, target_country)
+        crows = find_country_rows(df, country_rule, target_country, anchors)
     except Exception as e:
         route["errors"].append(f"国家行定位失败: {e}")
         return route
@@ -693,8 +663,13 @@ def parse_route(df: pd.DataFrame, sheet_name: str, target_country: str, rules: p
         route["errors"].append(f"Sheet【{sheet_name}】中未找到国家【{target_country}】的数据行")
         return route
 
-    # 国家粒度、列定位字段：Time、Volume Limit
-    for field, fmt in [("Time (workday/nature day)", None), ("Volume Limit (cm)", None)]:
+    country_context = "\n".join(
+        f"Excel Row {r + 1}: " + " | ".join(norm(v) for v in df.iloc[r].tolist() if norm(v))
+        for r in crows
+    )
+
+    # 国家粒度、列定位字段：Time、Volume Limit（先取原始文本，供AI上下文与兜底）
+    for field in ["Time (workday/nature day)", "Volume Limit (cm)"]:
         rule = get_rule(rules, field)
         try:
             col = locate_column(df, rule)
@@ -703,42 +678,74 @@ def parse_route(df: pd.DataFrame, sheet_name: str, target_country: str, rules: p
             route[f"{field}_raw"] = ""
             route["errors"].append(f"{field}: {e}")
 
-    # 章节文本字段（供AI）
+    # 章节文本字段（供AI，锚点来自Mapping行定位值）
     notes = {}
-    for field in ["Cargo forbidden", "Volume to Weight parameter", "Pick&Packing/parcel", "Tax Policy"]:
+    for field in ["Cargo forbidden", "Volume to Weight Parameter", "Pick&Packing/parcel", "Tax Policy"]:
         rule = get_rule(rules, field)
         if norm(rule["行定位类型"]) in {"text_anchor", "header_text"}:
             notes[field] = extract_section(df, norm(rule["行定位值"]))
 
-    # 重量段明细
-    weight_records = []
+    # 源重量段（中间字段，不写入最终数据表）
+    segments = []
     try:
-        wmin_rule = get_rule(rules, "Weight Range (min kg)")
-        wmax_rule = get_rule(rules, "Weight Range (max kg)")
+        seg_rule = get_rule(rules, "源重量段")
         kg_rule = get_rule(rules, "RMB /kg")
         parcel_rule = get_rule(rules, "RMB /parcel")
-        total_rule = get_rule(rules, "RMB in total")
-
-        wcol = locate_column(df, wmin_rule)
+        wcol = locate_column(df, seg_rule)
         kgcol = locate_column(df, kg_rule)
         pcol = locate_column(df, parcel_rule)
-
         for r in crows:
-            wmin = run_parser(wmin_rule, df.iat[r, wcol])
-            wmax = run_parser(wmax_rule, df.iat[r, wcol])
-            rmb_kg = run_parser(kg_rule, df.iat[r, kgcol])
-            rmb_parcel = run_parser(parcel_rule, df.iat[r, pcol])
-            total = calculate_total_by_mapping(total_rule, wmax, rmb_kg, rmb_parcel, None)
-            weight_records.append({
+            bounds = run_parser(seg_rule, df.iat[r, wcol])
+            if bounds is None:
+                route["errors"].append(f"第{r + 1}行重量段无法解析：{norm(df.iat[r, wcol])}")
+                continue
+            segments.append({
                 "excel_row": r + 1,
-                "Weight Range (min kg)": wmin,
-                "Weight Range (max kg)": wmax,
-                "RMB /kg": rmb_kg,
-                "RMB /parcel": rmb_parcel,
-                "RMB in total": total,
+                "min": bounds[0],
+                "max": bounds[1],
+                "RMB /kg": run_parser(kg_rule, df.iat[r, kgcol]),
+                "RMB /parcel": run_parser(parcel_rule, df.iat[r, pcol]),
             })
     except Exception as e:
-        route["errors"].append(f"重量段解析失败: {e}")
+        route["errors"].append(f"源重量段解析失败: {e}")
+
+    # AI结构化（AI指令全部来自Mapping）
+    meta: Dict[str, Any] = {}
+    try:
+        meta = ai_metadata(target_country, country_context, notes, rules)
+    except Exception as e:
+        route["errors"].append(f"AI结构化失败: {e}")
+
+    pick_pack = meta.get("Pick&Packing/parcel")
+    route["Cargo forbidden"] = format_forbidden(meta.get("Cargo forbidden"))
+    route["Time (workday/nature day)"] = format_time(meta.get("Time")) or route.get("Time (workday/nature day)_raw") or None
+    route["Volume Limit (cm)"] = format_dimension(meta.get("Volume Limit")) or route.get("Volume Limit (cm)_raw") or None
+    route["Volume to Weight Parameter"] = format_volume_weight(meta.get("Volume to Weight Parameter"))
+    route["Pick&Packing/parcel"] = pick_pack if pick_pack not in {None, ""} else "unknown"
+    route["Tax Policy"] = format_tax(meta.get("Tax Policy"))
+
+    # Weight (kg) 梯度展开：0.25递增、不超过最大计费重量，每点继承所在源重量段价格
+    weight_records = []
+    try:
+        ladder_rule = get_rule(rules, "Weight (kg)")
+        total_rule = get_rule(rules, "RMB in total")
+        if segments:
+            source_max = max(s["max"] for s in segments)
+            for w in run_parser(ladder_rule, source_max):
+                seg = next((s for s in segments if s["min"] < w <= s["max"]), None)
+                if seg is None:
+                    route["errors"].append(f"Weight (kg)={w} 未落入任何源重量段")
+                    continue
+                total = calculate_total_by_mapping(total_rule, w, seg["RMB /kg"], seg["RMB /parcel"], pick_pack)
+                weight_records.append({
+                    "source_excel_row": seg["excel_row"],
+                    "Weight (kg)": w,
+                    "RMB /kg": seg["RMB /kg"],
+                    "RMB /parcel": seg["RMB /parcel"],
+                    "RMB in total": total,
+                })
+    except Exception as e:
+        route["errors"].append(f"Weight (kg)解析失败: {e}")
 
     route["weight_records"] = weight_records
     route["notes"] = notes
@@ -749,7 +756,7 @@ def parse_route(df: pd.DataFrame, sheet_name: str, target_country: str, rules: p
 # ⑫ Streamlit 页面逻辑
 # ============================================================
 uploaded = st.file_uploader("上传供应商报价表（xlsx）", type=["xlsx", "xls"])
-target_country = st.text_input("目标国家（如：墨西哥）", "").strip()
+target_country = st.text_input("目标国家（如：美国）", "").strip()
 
 if uploaded is not None:
     file_bytes = uploaded.getvalue()
@@ -797,17 +804,16 @@ if uploaded is not None:
                             norm(route.get("ID")),
                             target_country,
                             norm(route.get("Cargo Category")),
-                            "",  # Cargo forbidden（AI，待接入）
-                            norm(route.get("Time (workday/nature day)_raw")),
-                            norm(route.get("Volume Limit (cm)_raw")),
-                            "",  # Volume to Weight parameter（AI，待接入）
-                            rec["Weight Range (min kg)"] if rec["Weight Range (min kg)"] is not None else "",
-                            rec["Weight Range (max kg)"] if rec["Weight Range (max kg)"] is not None else "",
+                            norm(route.get("Cargo forbidden")),
+                            norm(route.get("Time (workday/nature day)")),
+                            norm(route.get("Volume Limit (cm)")),
+                            norm(route.get("Volume to Weight Parameter")),
+                            rec["Weight (kg)"],
                             rec["RMB /kg"] if rec["RMB /kg"] is not None else "",
                             rec["RMB /parcel"] if rec["RMB /parcel"] is not None else "",
-                            "",  # Pick&Packing（AI，待接入）
+                            norm(route.get("Pick&Packing/parcel")),
                             rec["RMB in total"] if rec["RMB in total"] is not None else "",
-                            "",  # Tax Policy（AI，待接入）
+                            norm(route.get("Tax Policy")),
                         ]
                         ws.append_row(row_values, value_input_option="RAW")
                         written += 1
