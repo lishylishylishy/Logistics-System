@@ -10,6 +10,7 @@ import streamlit as st
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
+
 # ============================================================
 # ① 固定配置：这里才放真正"通用"的系统配置
 # ============================================================
@@ -30,6 +31,7 @@ STANDARD_FIELDS = [
     "Weight (kg)", "RMB /kg", "RMB /parcel",
     "Pick&Packing/parcel", "RMB in total", "Tax Policy",
 ]
+
 
 # ============================================================
 # ② 页面
@@ -161,62 +163,81 @@ def get_country_worksheet(country: str):
 
 
 # ============================================================
-# ⑤ 供应商识别：先识别，再加载该供应商Mapping
+# ⑤ 供应商识别：一个供应商=一个tab，tab名即供应商名；命中后才加载校验
 # ============================================================
-def mapping_detection_keywords(mapping_sheet: str, rules: pd.DataFrame) -> List[str]:
-    raw_values = [norm(x) for x in rules.get("供应商识别关键词", pd.Series(dtype=str)).tolist() if norm(x)]
-    values = []
-    for raw in raw_values:
-        values.extend([x.strip() for x in re.split(r"[|,，;；]", raw) if x.strip()])
-    return list(dict.fromkeys(values)) if values else [mapping_sheet]
-
-
 @st.cache_data(show_spinner=False, ttl=600)
 def cached_mapping_sheet_names() -> List[str]:
     return get_mapping_sheet_names()
 
 
+def mapping_tab_keywords(mapping_sheet: str) -> List[str]:
+    # 轻量读取：只取"供应商识别关键词"列，不做全量schema校验，避免schema不全的tab报错
+    try:
+        ws = open_spreadsheet(RULE_SHEET_ID).worksheet(mapping_sheet)
+        values = ws.get_all_values()
+    except Exception:
+        return []
+    if not values:
+        return []
+    headers = [norm(x) for x in values[0]]
+    if "供应商识别关键词" not in headers:
+        return []
+    idx = headers.index("供应商识别关键词")
+    kws = []
+    for row in values[1:]:
+        if idx < len(row):
+            kws.extend([x.strip() for x in re.split(r"[|,，;；]", norm(row[idx])) if x.strip()])
+    return list(dict.fromkeys(kws))
+
+
 def detect_supplier(file_name: str, all_sheets: Dict[str, pd.DataFrame]) -> Tuple[str, pd.DataFrame, str]:
     candidates = []
-    # BUG修复：原代码每个候选供应商都重复调两次get_mapping_sheet_names()（每次都读云端表）
     mapping_names = cached_mapping_sheet_names()
 
     for mapping_sheet in mapping_names:
-        rules = load_mapping(mapping_sheet)
-        keywords = mapping_detection_keywords(mapping_sheet, rules)
         score = 0
         evidence = []
+        tab_n = norm(mapping_sheet).lower()
 
-        for keyword in keywords:
-            keyword_n = norm(keyword).lower()
-            if not keyword_n:
-                continue
+        # 1) tab名即供应商名：tab名匹配文件名/报价表Sheet名
+        if tab_n and tab_n in norm(file_name).lower():
+            score += 100
+            evidence.append(f"文件名:{mapping_sheet}")
+        hit_sheets = [s for s in all_sheets if tab_n and tab_n in norm(s).lower()]
+        if hit_sheets:
+            score += 80 + min(len(hit_sheets), 20)
+            evidence.append(f"Sheet:{hit_sheets[0]}")
 
+        # 2) tab内"供应商识别关键词"辅助匹配
+        for keyword in mapping_tab_keywords(mapping_sheet):
+            keyword_n = keyword.lower()
             if keyword_n in norm(file_name).lower():
                 score += 100
                 evidence.append(f"文件名:{keyword}")
-
             hit_sheets = [s for s in all_sheets if keyword_n in norm(s).lower()]
             if hit_sheets:
                 score += 80 + min(len(hit_sheets), 20)
                 evidence.append(f"Sheet:{hit_sheets[0]}")
 
         if score:
-            candidates.append((score, mapping_sheet, rules, "；".join(evidence)))
+            candidates.append((score, mapping_sheet, "；".join(evidence)))
 
     if not candidates:
         raise RuntimeError(
             "无法自动识别供应商。\n"
-            f"当前规则库供应商Mapping：{', '.join(mapping_names)}\n"
+            f"当前规则库Mapping tab：{', '.join(mapping_names)}\n"
             f"上传文件：{file_name}\n"
-            "请在供应商Mapping增加“供应商识别关键词”，或确保文件名/Sheet名包含供应商名称。"
+            "规则库中一个供应商对应一个tab，tab名即供应商名（如4PX）；"
+            "请确保tab名或tab内“供应商识别关键词”能匹配文件名/Sheet名。"
         )
 
     candidates.sort(key=lambda x: x[0], reverse=True)
     if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
-        raise RuntimeError(f"供应商识别冲突：{candidates[0][1]} / {candidates[1][1]}；请增加供应商识别关键词。")
+        raise RuntimeError(f"供应商识别冲突：{candidates[0][1]} / {candidates[1][1]}；请修改tab名或供应商识别关键词。")
 
-    return candidates[0][1], candidates[0][2], candidates[0][3]
+    winner = candidates[0][1]
+    rules = load_mapping(winner)
+    return winner, rules, candidates[0][2]
 
 
 # ============================================================
