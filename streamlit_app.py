@@ -681,6 +681,7 @@ def parse_route(df: pd.DataFrame, sheet_name: str, target_country: str, rules: p
         route["errors"].append(f"国家行定位失败: {e}")
         return route
     if not crows:
+        route["not_serviced"] = True
         route["errors"].append(f"Sheet【{sheet_name}】中未找到国家【{target_country}】的数据行")
         return route
 
@@ -808,20 +809,23 @@ if uploaded is not None:
                         st.warning("；".join(route["errors"]))
 
             failed = [r for r in results if not r.get("weight_records")]
-            if failed:
-                with st.expander(f"未解析出重量段的线路（{len(failed)}）"):
-                    for r in failed:
-                        st.write(f"- {r['sheet']}: {'；'.join(r['errors']) or '无数据行'}")
+            not_serviced = [r for r in failed if r.get("not_serviced")]
+            real_failed = [r for r in failed if not r.get("not_serviced")]
+            if not_serviced:
+                with st.expander(f"未开通【{target_country}】的线路（{len(not_serviced)}个，正常跳过）"):
+                    st.write("、".join(norm(r.get("sheet")) for r in not_serviced))
+            if real_failed:
+                with st.expander(f"解析失败的线路（{len(real_failed)}个）"):
+                    for r in real_failed:
+                        st.write(f"- {r['sheet']}: {'；'.join(r['errors'])}")
 
             if ok_routes and st.button("写入目标数据表（Google Sheets）"):
                 ws = get_country_worksheet(target_country)
-                existing = ws.get_all_values()
-                if not existing:
-                    ws.append_row(STANDARD_FIELDS, value_input_option="RAW")
-                written = 0
+
+                new_rows = []
                 for route in ok_routes:
                     for rec in route["weight_records"]:
-                        row_values = [
+                        new_rows.append([
                             norm(route.get("ID")),
                             target_country,
                             norm(route.get("Cargo Category")),
@@ -829,16 +833,43 @@ if uploaded is not None:
                             norm(route.get("Time (workday/nature day)")),
                             norm(route.get("Volume Limit (cm)")),
                             norm(route.get("Volume to Weight Parameter")),
-                            rec["Weight (kg)"],
-                            rec["RMB /kg"] if rec["RMB /kg"] is not None else "",
-                            rec["RMB /parcel"] if rec["RMB /parcel"] is not None else "",
+                            str(rec["Weight (kg)"]),
+                            str(rec["RMB /kg"]) if rec["RMB /kg"] is not None else "",
+                            str(rec["RMB /parcel"]) if rec["RMB /parcel"] is not None else "",
                             norm(route.get("Pick&Packing/parcel")),
-                            rec["RMB in total"] if rec["RMB in total"] is not None else "",
+                            str(rec["RMB in total"]) if rec["RMB in total"] is not None else "",
                             norm(route.get("Tax Policy")),
-                        ]
-                        ws.append_row(row_values, value_input_option="RAW")
-                        written += 1
-                st.success(f"已写入 {written} 行到数据表【{target_country}】工作表")
+                        ])
+
+                # 批量写入+主键去重：避免逐行append触发Google写配额(429)，重跑不产生重复行
+                existing = ws.get_all_values()
+                if not existing:
+                    ws.append_row(STANDARD_FIELDS, value_input_option="RAW")
+                    existing = [list(STANDARD_FIELDS)]
+                header = [norm(x) for x in existing[0]]
+
+                updates, appends = [], []
+                if all(k in header for k in PRIMARY_KEYS):
+                    kidx = [header.index(k) for k in PRIMARY_KEYS]
+                    old = {}
+                    for i, row in enumerate(existing[1:], start=2):
+                        key = tuple(norm(row[j]) if j < len(row) else "" for j in kidx)
+                        old.setdefault(key, i)
+                    for values in new_rows:
+                        key = tuple(values[header.index(k)] for k in PRIMARY_KEYS)
+                        if key in old:
+                            updates.append({"range": f"A{old[key]}:M{old[key]}", "values": [values]})
+                        else:
+                            old[key] = -1
+                            appends.append(values)
+                else:
+                    appends = new_rows
+
+                if updates:
+                    ws.batch_update(updates, value_input_option="RAW")
+                for i in range(0, len(appends), 1000):
+                    ws.append_rows(appends[i:i + 1000], value_input_option="RAW")
+                st.success(f"写入完成：更新{len(updates)}行、新增{len(appends)}行（共{len(new_rows)}行）")
 
     except Exception as e:
         st.error(str(e))
