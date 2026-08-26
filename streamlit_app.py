@@ -30,7 +30,7 @@ STANDARD_FIELDS = [
     "Time Min (day)", "Time Max (day)", "Time Type (workday/nature day)",
     "Volume Limit (cm)", "Volume to Weight Parameter",
     "Weight (kg)", "RMB /kg", "RMB /parcel",
-    "Pick&Packing/parcel", "RMB in total", "DDP", "Tax Policy",
+    "Pick&Packing/parcel", "RMB in total", "DDP", "Extra Tax Required", "Tax Policy",
 ]
 
 
@@ -564,7 +564,8 @@ def ai_json(prompt: str, context: str) -> Dict[str, Any]:
 def ai_metadata(target_country: str, country_context: str, notes: Dict[str, str], rules: pd.DataFrame) -> Dict[str, Any]:
     fields = [
         "Cargo forbidden", "Time Min (day)", "Time Max (day)", "Time Type (workday/nature day)",
-        "Volume Limit (cm)", "Volume to Weight Parameter", "Pick&Packing/parcel", "DDP", "Tax Policy",
+        "Volume Limit (cm)", "Volume to Weight Parameter", "Pick&Packing/parcel",
+        "DDP", "Extra Tax Required", "Tax Policy",
     ]
 
     instructions = []
@@ -588,12 +589,13 @@ def ai_metadata(target_country: str, country_context: str, notes: Dict[str, str]
   "Volume to Weight Parameter": null,
   "Pick&Packing/parcel": "unknown",
   "DDP": "unknown",
+  "Extra Tax Required": "unknown",
   "Tax Policy": {{"delivery_term": null, "fob_limit_usd": null, "cif_limit_usd": null, "raw": null}}
 }}
 
 要求：
 - Time.min/Time.max只输出数字，单一值时两者相同；unit只能是workday或nature day；risk_note为延误风险提示原文，没有则null。
-- DDP只能是yes/no/unknown。
+- DDP、Extra Tax Required只能是yes/no/unknown，且严格按照各自字段要求中的判定规则执行。
 - Pick&Packing不能确认费用时必须返回"unknown"。
 - 不得猜测。
 """
@@ -773,6 +775,7 @@ def parse_route(df: pd.DataFrame, sheet_name: str, target_country: str, rules: p
     route["Volume to Weight Parameter"] = format_volume_weight(meta.get("Volume to Weight Parameter"))
     route["Pick&Packing/parcel"] = pick_pack if pick_pack not in {None, ""} else "unknown"
     route["DDP"] = meta.get("DDP") or "unknown"
+    route["Extra Tax Required"] = meta.get("Extra Tax Required") or "unknown"
     route["Tax Policy"] = format_tax(meta.get("Tax Policy"))
 
     # Weight (kg) 梯度展开：0.25递增、不超过最大计费重量，每点继承所在源重量段价格
@@ -931,6 +934,7 @@ if uploaded is not None:
                                 "Pick&Packing/parcel": norm(route.get("Pick&Packing/parcel")),
                                 "RMB in total": fmt_num(rec["RMB in total"]),
                                 "DDP": norm(route.get("DDP")),
+                                "Extra Tax Required": norm(route.get("Extra Tax Required")),
                                 "Tax Policy": norm(route.get("Tax Policy")),
                             }
                             row_values = [""] * ncols
