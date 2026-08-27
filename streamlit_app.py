@@ -858,7 +858,9 @@ if uploaded is not None:
                     if x is None or x == "":
                         return ""
                     try:
-                        f = float(x)
+                        f = float(x)                # 如果传了 decimals（比如 2），就强制保留指定位数的小数
+                        if decimals is not None:    # 没传 decimals，则保持原样（整数转 int，小数保留原样）
+                            return round(f, decimals)
                         return str(int(f)) if f == int(f) else str(f)
                     except (TypeError, ValueError):
                         return norm(x)
@@ -928,11 +930,13 @@ if uploaded is not None:
                                 "Time Type (workday/nature day)": norm(route.get("Time Type (workday/nature day)")),
                                 "Volume Limit (cm)": norm(route.get("Volume Limit (cm)")),
                                 "Volume to Weight Parameter": norm(route.get("Volume to Weight Parameter")),
-                                "Weight (kg)": fmt_num(rec["Weight (kg)"]),
-                                "RMB /kg": fmt_num(rec["RMB /kg"]),
-                                "RMB /parcel": fmt_num(rec["RMB /parcel"]),
+                                #以下5项指定保留 2 位小数
+                                "Weight (kg)": fmt_num(rec["Weight (kg)"],2),
+                                "RMB /kg": fmt_num(rec["RMB /kg"],2),
+                                "RMB /parcel": fmt_num(rec["RMB /parcel"],2),
                                 "Pick&Packing/parcel": norm(route.get("Pick&Packing/parcel")),
-                                "RMB in total": fmt_num(rec["RMB in total"]),
+                                "RMB in total": fmt_num(rec["RMB in total"],2),
+                                
                                 "DDP": norm(route.get("DDP")),
                                 "Extra Tax Required": norm(route.get("Extra Tax Required")),
                                 "Tax Policy": norm(route.get("Tax Policy")),
