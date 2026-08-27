@@ -854,7 +854,7 @@ if uploaded is not None:
             if ok_routes and st.button("写入目标数据表（Google Sheets）"):
                 ws = get_country_worksheet(target_country)
 
-                def fmt_num(x: Any) -> str:
+                def fmt_num(x: Any) -> Any:
                     if x is None or x == "":
                         return ""
                     try:
@@ -953,9 +953,9 @@ if uploaded is not None:
                                 appends.append(row_values)
 
                 if updates:
-                    ws.batch_update(updates, value_input_option="RAW")
+                    ws.batch_update(updates, value_input_option="USER_ENTERED")
                 for i in range(0, len(appends), 1000):
-                    ws.append_rows(appends[i:i + 1000], value_input_option="RAW")
+                    ws.append_rows(appends[i:i + 1000], value_input_option="USER_ENTERED")
                 st.success(f"写入完成：更新{len(updates)}行、新增{len(appends)}行（共{len(updates) + len(appends)}行）")
 
     except Exception as e:
