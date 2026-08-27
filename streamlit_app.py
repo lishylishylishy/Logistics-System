@@ -21,7 +21,7 @@ GCP_JSON = st.secrets["gcp_json"]                 # Google Service Account JSON
 
 # AI model API
 AI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-AI_MODEL = "Gemini 2.5 Flash"
+AI_MODEL = "Gemini 3.5 Flash"
 
 PRIMARY_KEYS = ["ID", "Destination Country", "Supplier", "Weight (kg)"]
 
