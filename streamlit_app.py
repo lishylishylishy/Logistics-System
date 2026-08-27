@@ -19,9 +19,9 @@ DATA_SHEET_ID = st.secrets["DATA_SHEET_ID"]       # 最终数据
 AI_API_KEY = st.secrets["API_KEY"]                # AI API
 GCP_JSON = st.secrets["gcp_json"]                 # Google Service Account JSON
 
-# BUG修复：原代码URL被反引号包住，会变成非法字符串
-AI_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-AI_MODEL = "qwen3.7-plus"
+# AI model API
+AI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+AI_MODEL = "Gemini 2.5 Flash"
 
 PRIMARY_KEYS = ["ID", "Destination Country", "Supplier", "Weight (kg)"]
 
