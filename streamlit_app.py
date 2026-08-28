@@ -585,12 +585,12 @@ def ai_metadata(target_country: str, country_context: str, notes: Dict[str, str]
 {{
   "Cargo forbidden": [],
   "Time": {{"min": null, "max": null, "unit": null, "risk_note": null}},
-  "Volume Limit": {{"length_cm": null, "width_cm": null, "height_cm": null, "max_length_cm": null, "max_volume_m3": null, "formula": null, "raw": null}},
+  "Volume Limit": {{"length_cm": null, "width_cm": null, "height_cm": null, "max_length_cm": null, "max_summary_of_3_lengths_cm": null, "raw": null}},
   "Volume to Weight Parameter": null,
   "Pick&Packing/parcel": "unknown",
   "DDP": "unknown",
   "Extra Tax Required": "unknown",
-  "Tax Policy": {{"delivery_term": null, "fob_limit_usd": null, "cif_limit_usd": null, "raw": null}}
+  "Tax Policy": {{"delivery_term": null, "fob_limit_usd": null, "cif_limit_usd": null, "tax_formula": null, "tax_payer": null, "raw": null}}
 }}
 
 要求：
@@ -616,24 +616,31 @@ def format_dimension(value: Any) -> Optional[str]:
         return None
     if not isinstance(value, dict):
         return norm(value) or None
-
     parts = []
-    if all(value.get(x) is not None for x in ["length_cm", "width_cm", "height_cm"]):
-        parts.append(f"{value['length_cm']}×{value['width_cm']}×{value['height_cm']} cm")
+    # 1. 长×宽×高
+    if all(
+        value.get(x) is not None
+        for x in ["length_cm", "width_cm", "height_cm"]
+    ):
+        parts.append(
+            f"max size = "
+            f"{value['length_cm']}×"
+            f"{value['width_cm']}×"
+            f"{value['height_cm']}cm"
+        )
+    # 2. 单边最大长度
     if value.get("max_length_cm") is not None:
-        parts.append(f"max_length={value['max_length_cm']}cm")
-    if value.get("max_volume_m3") is not None:
-        parts.append(f"max_volume={value['max_volume_m3']}m³")
-    if value.get("formula"):
-        parts.append(f"formula={value['formula']}")
+        parts.append(
+            f"max lenth = {value['max_length_cm']}cm"
+        )
+    # 3. 三边之和最大值
+    if value.get("max_summary_of_3_lengths_cm") is not None:
+        parts.append(
+            f"max summary of 3 lenthes = "
+            f"{value['max_summary_of_3_lengths_cm']}cm"
+        )
+    # 都没结构化成功时保留原文
     return "; ".join(parts) or norm(value.get("raw")) or None
-
-
-def format_tax(value: Any) -> Optional[str]:
-    if not value:
-        return None
-    if not isinstance(value, dict):
-        return norm(value) or None
 
     parts = []
     if value.get("delivery_term"):
