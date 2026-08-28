@@ -658,6 +658,21 @@ def format_tax(value: Any) -> Optional[str]:
     return ", ".join(parts) or norm(value.get("raw")) or None
 
 
+def format_forbidden(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        items = [norm(x) for x in value if norm(x)]
+        return "；".join(items) if items else None
+    return norm(value) or None
+
+
+def format_volume_weight(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
+    return norm(value) or None
 # ============================================================
 # ⑪ 单条线路解析主流程（通用引擎，专用规则全部来自Mapping）
 # ============================================================
