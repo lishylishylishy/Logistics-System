@@ -642,31 +642,20 @@ def format_dimension(value: Any) -> Optional[str]:
     # 都没结构化成功时保留原文
     return "; ".join(parts) or norm(value.get("raw")) or None
 
+
+def format_tax(value: Any) -> Optional[str]:
+    if not value:
+        return None
+    if not isinstance(value, dict):
+        return norm(value) or None
     parts = []
     if value.get("delivery_term"):
         parts.append(str(value["delivery_term"]))
     if value.get("fob_limit_usd") is not None:
-        parts.append(f"FOB < {value['fob_limit_usd']} USD")
+        parts.append(f"FOB < {value['fob_limit_usd']}")
     if value.get("cif_limit_usd") is not None:
-        parts.append(f"CIF < {value['cif_limit_usd']} USD")
+        parts.append(f"CIF < {value['cif_limit_usd']}")
     return ", ".join(parts) or norm(value.get("raw")) or None
-
-
-def format_forbidden(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, list):
-        items = [norm(x) for x in value if norm(x)]
-        return "；".join(items) if items else None
-    return norm(value) or None
-
-
-def format_volume_weight(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return str(value)
-    return norm(value) or None
 
 
 # ============================================================
@@ -861,7 +850,7 @@ if uploaded is not None:
             if ok_routes and st.button("写入目标数据表（Google Sheets）"):
                 ws = get_country_worksheet(target_country)
 
-                def fmt_num(x: Any) -> Any:
+                def fmt_num(x: Any, decimals: Optional[int] = None) -> Any:
                     if x is None or x == "":
                         return ""
                     try:
