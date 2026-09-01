@@ -130,7 +130,7 @@ def get_mapping_sheet_names() -> List[str]:
             result.append(name)
     return result
 
-
+#映射规则-1. 读取 Mapping#
 def load_mapping(mapping_sheet: str) -> pd.DataFrame:
     sh = open_spreadsheet(RULE_SHEET_ID)
     try:
@@ -139,6 +139,7 @@ def load_mapping(mapping_sheet: str) -> pd.DataFrame:
         raise RuntimeError(f"规则库中不存在供应商Mapping：{mapping_sheet}") from e
 
     df = pd.DataFrame(ws.get_all_records())
+#映射规则-2. 检查 是否存在这些列#
     required = [
         "字段", "是否AI读取", "提取粒度", "记录唯一键",
         "Sheet定位类型", "Sheet定位值", "行定位类型", "行定位值",
@@ -474,7 +475,7 @@ def generate_weight_ladder(source_max: Optional[float], rule: Dict[str, Any]) ->
         w += step
     return ladder
 
-
+#映射规则-0. 总开关#
 def run_parser(rule: Dict[str, Any], *args) -> Any:
     name = norm(rule.get("Python解析器", ""))
     if not name:
@@ -569,6 +570,9 @@ def ai_metadata(target_country: str, country_context: str, notes: Dict[str, str]
     ]
 
     instructions = []
+    
+#映射规则-3. 找到某个字段的规则#
+    
     for field in fields:
         rule = get_rule(rules, field)
         if to_bool(rule["是否AI读取"]):
@@ -679,6 +683,8 @@ def format_volume_weight(value: Any) -> Optional[str]:
 def parse_route(df: pd.DataFrame, sheet_name: str, target_country: str, rules: pd.DataFrame, supplier: str) -> Dict[str, Any]:
     route: Dict[str, Any] = {"sheet": sheet_name, "country": target_country, "errors": []}
 
+#映射规则-3. 找到某个字段的规则#
+    
     # 线路/供应商粒度字段：ID、Cargo Category从sheet名解析，Supplier=Mapping tab名
     for field in ["ID", "Cargo Category", "Supplier"]:
         rule = get_rule(rules, field)
