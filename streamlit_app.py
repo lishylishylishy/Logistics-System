@@ -26,7 +26,7 @@ GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_UPLOAD = "https://generativelanguage.googleapis.com/upload/v1beta/files"
 
 # 最终数据唯一键：同一ID、国家、重量点只保留一行
-PRIMARY_KEYS = ["ID", "Destination Country", "Weight (kg)"]
+PRIMARY_KEYS = ["ID", "Destination Country", "Cargo Category", "Weight (kg)"]
 
 # 最终数据表固定字段；Weight / RMB in total / USD in total由Python或公式控制
 STANDARD_FIELDS = [
@@ -287,29 +287,23 @@ def ai_extract_full_excel(file_hash: str, file_bytes: bytes, file_name: str, sup
         gemini_wait_file(file_name_api)
         prompt = f"""
 你是严谨的物流报价表数据提取专家。
-
 当前供应商：{supplier}
 当前上传文件名：{file_name}
 目标国家：{target_country}
-Python固定重量点：{json.dumps(FIXED_WEIGHTS, ensure_ascii=False)}
-
-下面是唯一有效的供应商 Mapping 规则。请把其中的“Sheet定位类型、Sheet定位值、行定位类型、行定位值、列定位类型、列定位值、原始提取类型、Python解析器、Python规则参数、AI指令、说明”等全部视为规则说明，严格执行；不要用你自己的物流经验替代这些规则。
+【Mapping使用规则】
+1. Mapping是唯一的数据提取规则，优先按Mapping规则处理。
+2. Mapping的每个字段为一项任务，请根据Mapping规则和当前上传文件逐一回答每个字段。对某具体字段来说，在当前上传文件中，从名称为“Sheet名称”的sheet的“Sheet列名”列、“Sheet行名”行中，在其“内容定位”中检索“提取内容”，将“提取内容”按照“映射规则”转换，将转换后的内容按照“输出格式”输出，“示例”为该字段输出内容示意，不是固定正确答案。若无可用信息，按“默认值”输出。
+3. 必须在整个Excel文件范围内按照Mapping寻找数据，不得只检查一个Sheet。
+4. 仅输出目标国家“{target_country}”存在的有效线路。
+5. Weight (kg)使用Python提供的固定值：{json.dumps(FIXED_WEIGHTS, ensure_ascii=False)}，不得修改。
+6. 对每个固定Weight，按照Mapping判断Excel中是否存在实际覆盖该Weight的重量段；不存在则对应价格返回null，不得猜测或延伸。
+7. Supplier固定为“{supplier}”。
+8. RMB in total、USD in total不要计算，返回null，由后续程序处理。
 
 【Mapping】
 {mapping_text}
 
-【任务】
-请完整阅读当前上传的Excel文件，并按照上述Mapping处理目标国家“{target_country}”。不要只检查一个Sheet；需要根据Mapping中每个字段的位置定位、内容、格式等要求，在整个文件范围内寻找每个字段的信息。
-1. ID。请按照Mapping从Sheet名称等信息取得ID。
-2. Destination Country。只输出实际开通目标国家“{target_country}”的线路；没有目标国家数据的线路不要输出。
-3. Weight (kg)。对每条线路输出Python固定提供的全部Weight (kg)：{json.dumps(FIXED_WEIGHTS, ensure_ascii=False)}。不得修改重量、不得增加或删除重量。
-4. RMB /kg和RMB /parcel。对每个Weight (kg)重量，按照Mapping在文件中寻找该重量实际对应的RMB /kg和RMB /parcel。如果文件中不存在该Weight (kg)对应的RMB /kg和RMB /parcel，必须返回RMB /kg=null、RMB /parcel=null；不得把其他重量段价格延伸过去，不得猜测。
-5. Supplier固定为当前供应商“{supplier}”。
-6. RMB in total、USD in total不要计算，交给Python/Google Sheets处理。
-7. 无法确认的信息返回null；mapping有特殊、明确要求的，按mapping要求执行。
-8. 严格按照Mapping中每个字段的位置定位、内容、格式等要求，在整个文件范围内寻找每个字段的信息，按Mapping规定的输出格式输出内容。
-
-必须返回合法JSON，结构严格如下：
+只返回合法JSON，结构严格如下：
 {{
   "routes": [
     {{
