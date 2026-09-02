@@ -252,13 +252,13 @@ def gemini_upload_file(file_bytes: bytes, file_name: str) -> Dict[str, Any]:
 
 
 def gemini_wait_file(file_name: str, timeout: int = 120) -> Dict[str, Any]:
-    """等待Gemini把上传的XLSX处理到可供模型读取。"""
+    """等待Gemini把上传的XLSX处理到可供模型读取；API的state是字符串。"""
     end = time.time() + timeout
     while time.time() < end:
         r = requests.get(f"{GEMINI_BASE}/{file_name}?key={AI_API_KEY}", timeout=30)
         r.raise_for_status()
-        data = r.json()
-        state = norm((data.get("state") or {}).get("name"))
+        data = r.json().get("file", r.json())
+        state = norm(data.get("state"))
         if state in {"ACTIVE", ""}:
             return data
         if state == "FAILED":
@@ -330,7 +330,7 @@ Python固定重量点：{json.dumps(FIXED_WEIGHTS, ensure_ascii=False)}
       "Tax Policy": null,
       "Weight Prices": [
         {{"Weight (kg)": 0.25, "RMB /kg": null, "RMB /parcel": null}},
-        {{"Weight (kg)": 0.50, "RMB /kg": null, "RMB /parcel": null}}
+        {{"Weight (kg)": 0.5, "RMB /kg": null, "RMB /parcel": null}}
       ]
     }}
   ]
