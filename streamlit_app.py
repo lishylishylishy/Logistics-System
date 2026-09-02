@@ -444,7 +444,11 @@ def ensure_header(ws):
     missing = [f for f in STANDARD_FIELDS if f not in final_header]
     if missing:
         start = len(final_header) + 1
-        ws.update(f"{col_letter(start)}1:{col_letter(start + len(missing) - 1)}1", [missing], value_input_option="RAW")
+        ws.update(
+            f"{col_letter(start)}1:{col_letter(start + len(missing) - 1)}1",
+            [missing],
+            value_input_option="RAW"
+        )
         final_header += missing
     return final_header, numbered[1:]
 
@@ -485,7 +489,10 @@ def write_results(country: str, routes: List[Dict[str, Any]]) -> Tuple[int, int]
     # 现有数据按唯一键建立索引
     old = {}
     for no, row in data_rows:
-        key = tuple(norm(row[pos[k]]) if pos[k] < len(row) else "" for k in PRIMARY_KEYS)
+        key = tuple(
+            norm(row[pos[k]]) if pos[k] < len(row) else ""
+            for k in PRIMARY_KEYS
+        )
         old.setdefault(key, no)
 
     updates, appends = [], []
@@ -497,38 +504,111 @@ def write_results(country: str, routes: List[Dict[str, Any]]) -> Tuple[int, int]
         else:
             runs.append([c, c])
 
-    records = [build_record(route, item) for route in routes for item in route["Weight Prices"]]
+    records = [
+        build_record(route, item)
+        for route in routes
+        for item in route["Weight Prices"]
+    ]
+
     append_start = max([no for no, _ in data_rows], default=1) + 1
 
     for record in records:
-        key = tuple(record[k] for k in PRIMARY_KEYS)
+
+        # ====================================================
+        # 唯一键严格由 PRIMARY_KEYS 决定
+        # PRIMARY_KEYS =
+        # ["ID", "Destination Country", "Cargo Category", "Weight (kg)"]
+        # ====================================================
+        key = tuple(
+            norm(record.get(k))
+            for k in PRIMARY_KEYS
+        )
+
         row_no = old.get(key)
+
         if row_no is None:
+            # Primary Key 不存在 → 新建行
             row_no = append_start + len(appends)
+
+            # 立即加入索引，保证同一次上传中
+            # 相同 Primary Key 不会重复新增
+            old[key] = row_no
+
+            is_new = True
+        else:
+            # Primary Key 已存在 → 更新原行
+            is_new = False
+
         row_values = [""] * ncols
+
         for f in STANDARD_FIELDS:
             if f in {"RMB in total", "USD in total"}:
                 continue
             row_values[pos[f]] = record[f]
-        weight_ref = value_for_formula_col(pos, "Weight (kg)", row_no)
-        kg_ref = value_for_formula_col(pos, "RMB /kg", row_no)
-        parcel_ref = value_for_formula_col(pos, "RMB /parcel", row_no)
-        pick_ref = value_for_formula_col(pos, "Pick&Packing/parcel", row_no)
-        total_ref = value_for_formula_col(pos, "RMB in total", row_no)
-        row_values[pos["RMB in total"]] = f'=IF(OR({weight_ref}="",{kg_ref}=""),"",{weight_ref}*{kg_ref}+IFERROR(VALUE({parcel_ref}),0)+IFERROR(VALUE({pick_ref}),0))'
-        row_values[pos["USD in total"]] = f'=IF({total_ref}="","",{total_ref}*GOOGLEFINANCE("CURRENCY:CNYUSD"))'
 
-        if key in old:
-            for a, b in runs:
-                updates.append({"range": f"{col_letter(a + 1)}{row_no}:{col_letter(b + 1)}{row_no}", "values": [row_values[a:b + 1]]})
-        else:
-            old[key] = row_no
+        weight_ref = value_for_formula_col(
+            pos,
+            "Weight (kg)",
+            row_no
+        )
+        kg_ref = value_for_formula_col(
+            pos,
+            "RMB /kg",
+            row_no
+        )
+        parcel_ref = value_for_formula_col(
+            pos,
+            "RMB /parcel",
+            row_no
+        )
+        pick_ref = value_for_formula_col(
+            pos,
+            "Pick&Packing/parcel",
+            row_no
+        )
+        total_ref = value_for_formula_col(
+            pos,
+            "RMB in total",
+            row_no
+        )
+
+        row_values[pos["RMB in total"]] = (
+            f'=IF(OR({weight_ref}="",{kg_ref}=""),"",'
+            f'{weight_ref}*{kg_ref}+'
+            f'IFERROR(VALUE({parcel_ref}),0)+'
+            f'IFERROR(VALUE({pick_ref}),0))'
+        )
+
+        row_values[pos["USD in total"]] = (
+            f'=IF({total_ref}="","",'
+            f'{total_ref}*GOOGLEFINANCE("CURRENCY:CNYUSD"))'
+        )
+
+        # ====================================================
+        # 已存在的 Primary Key → 更新原行
+        # 不存在的 Primary Key → 新增行
+        # ====================================================
+        if is_new:
             appends.append(row_values)
+        else:
+            for a, b in runs:
+                updates.append({
+                    "range": f"{col_letter(a + 1)}{row_no}:{col_letter(b + 1)}{row_no}",
+                    "values": [row_values[a:b + 1]]
+                })
 
     if updates:
-        ws.batch_update(updates, value_input_option="USER_ENTERED")
+        ws.batch_update(
+            updates,
+            value_input_option="USER_ENTERED"
+        )
+
     if appends:
-        ws.append_rows(appends, value_input_option="USER_ENTERED")
+        ws.append_rows(
+            appends,
+            value_input_option="USER_ENTERED"
+        )
+
     return len(updates), len(appends)
 
 
