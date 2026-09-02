@@ -505,8 +505,8 @@ def write_results(country: str, routes: List[Dict[str, Any]]) -> Tuple[int, int]
                 row[pos[k]] if pos[k] < len(row) else ""
             )
             for k in PRIMARY_KEYS
-    )
-    old.setdefault(key, no)
+        )
+        old.setdefault(key, no)
 
     updates, appends = [], []
     std_cols = sorted(pos[f] for f in STANDARD_FIELDS)
