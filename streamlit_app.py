@@ -26,7 +26,7 @@ GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_UPLOAD = "https://generativelanguage.googleapis.com/upload/v1beta/files"
 
 # 最终数据唯一键：同一ID、国家、重量点只保留一行
-PRIMARY_KEYS = ["ID", "Destination Country", "Cargo Category", "Weight (kg)"]
+PRIMARY_KEYS = ["ID", "Destination Country", "Supplier", "Cargo Category", "Weight (kg)"]
 
 # 最终数据表固定字段；Weight / RMB in total / USD in total由Python或公式控制
 STANDARD_FIELDS = [
@@ -87,7 +87,17 @@ def fmt_num(value: Any, decimals: Optional[int] = None) -> Any:
         return str(int(f)) if f == int(f) else str(f)
     except (TypeError, ValueError):
         return norm(value)
+#检查替换"Weight (kg)"的1、2、3
+def normalize_primary_key(field: str, value: Any) -> str:
+    value = norm(value)
 
+    if field == "Weight (kg)":
+        try:
+            f = float(value)
+            return str(int(f)) if f == int(f) else str(f)
+        except (TypeError, ValueError):
+            return value
+    return value
 
 def parse_json_response(text: str) -> Dict[str, Any]:
     raw = norm(text)
@@ -490,10 +500,13 @@ def write_results(country: str, routes: List[Dict[str, Any]]) -> Tuple[int, int]
     old = {}
     for no, row in data_rows:
         key = tuple(
-            norm(row[pos[k]]) if pos[k] < len(row) else ""
+            normalize_primary_key(
+                k,
+                row[pos[k]] if pos[k] < len(row) else ""
+            )
             for k in PRIMARY_KEYS
-        )
-        old.setdefault(key, no)
+    )
+    old.setdefault(key, no)
 
     updates, appends = [], []
     std_cols = sorted(pos[f] for f in STANDARD_FIELDS)
@@ -520,7 +533,7 @@ def write_results(country: str, routes: List[Dict[str, Any]]) -> Tuple[int, int]
         # ["ID", "Destination Country", "Cargo Category", "Weight (kg)"]
         # ====================================================
         key = tuple(
-            norm(record.get(k))
+            normalize_primary_key(k, record.get(k))
             for k in PRIMARY_KEYS
         )
 
