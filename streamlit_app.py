@@ -389,24 +389,18 @@ def ai_extract_full_excel(
 
         prompt = f"""
 你是严谨的物流报价表数据提取专家。
-
 【Mapping使用规则】
-
 1. Mapping是唯一的数据提取规则，优先按Mapping规则处理。mapping中，当前供应商={supplier}；当前上传文件={file_name}；目标国家={target_country}
-2. Mapping的每个字段为一项任务，请完成“是否AI读取”为“是”的字段内容，根据Mapping规则和当前上传文件逐一输出每个字段内容。对某具体字段来说，在当前上传文件中，从名称为“Sheet名称”的sheet的“Sheet列名”列、“Sheet行名”行中，在其“内容定位”中检索“提取内容”，将“提取内容”按照“映射规则”转换，最后将转换后的内容按照“输出格式”输出字段内容，“示例”为该字段内容的格式示意，不是最终输出的字段内容。若某字段无可用信息，按“默认值”输出。
+2. Mapping的每个字段为一项任务，请完成“是否AI读取”为“是”的字段内容，根据Mapping和{file_name}逐一输出每个字段内容。对某具体字段来说，在{file_name}中，从“Sheet名称”sheet的“Sheet列名”列、“Sheet行名”行中，在其“内容定位”中检索“提取内容”，将“提取内容”按照“映射规则”转换，最后“输出格式”是输出字段内容的格式要求，“示例”为该字段内容的格式示意，不是最终输出的字段内容。若某字段无可用信息，按“默认值”输出。
 3. 必须在整个Excel文件范围内按照Mapping寻找数据，不得只检查一个Sheet。
 4. 仅输出目标国家“{target_country}”存在的有效线路。
 5. Weight (kg)使用Python提供的固定值：{json.dumps(FIXED_WEIGHTS, ensure_ascii=False)}，不得修改。
-6. 对每个固定Weight，按照Mapping判断Excel中是否存在实际覆盖该Weight的重量段；不存在则对应价格返回null，不得猜测或延伸。
-7. Supplier固定为“{supplier}”。
+6. 对RMB /kg、RMB /parcel两个字段来说，根据具体的Weight (kg)值，按照Mapping在{file_name}中查找字段RMB /kg、字段RMB /parcel的对应值，若不存在对应值则返回null，不得猜测或杜撰。
+7. Supplier固定为“{supplier}”；Destination Countryr固定为“{target_country}”。
 8. RMB in total、USD in total不要计算，返回null，由后续程序处理。
-
 【Mapping】
-
 {mapping_text}
-
 只返回合法JSON，结构严格如下：
-
 {{
   "routes": [
     {{
@@ -899,7 +893,7 @@ def write_results(
 # ⑨ 页面主流程
 # ============================================================
 uploaded = st.file_uploader(
-    "上传供应商报价表（xlsx）",
+    "上传供应商报价表（.xlsx）",
     type=["xlsx", "xls"]
 )
 
