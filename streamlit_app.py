@@ -77,16 +77,16 @@ def safe_float(value: Any) -> Optional[float]:
     return float(m.group()) if m else None
 
 
-def fmt_num(value: Any, decimals: Optional[int] = None) -> Any:
-    if value is None or value == "":
-        return ""
-    try:
-        f = float(value)
-        if decimals is not None:
-            return round(f, decimals)
-        return str(int(f)) if f == int(f) else str(f)
-    except (TypeError, ValueError):
-        return norm(value)
+#def fmt_num(value: Any, decimals: Optional[int] = None) -> Any:
+#     if value is None or value == "":
+#         return ""
+#     try:
+#         f = float(value)
+#         if decimals is not None:
+#           return round(f, decimals)
+#        return str(int(f)) if f == int(f) else str(f)
+#    except (TypeError, ValueError):
+#        return norm(value)
 #检查替换"Weight (kg)"的1、2、3
 def normalize_primary_key(field: str, value: Any) -> str:
     value = norm(value)
@@ -475,9 +475,9 @@ def build_record(route: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
         "Time Type (workday/nature day)": norm(route.get("Time Type (workday/nature day)")),
         "Volume Limit (cm)": norm(route.get("Volume Limit (cm)")),
         "Volume to Weight Parameter": norm(route.get("Volume to Weight Parameter")),
-        "Weight (kg)": fmt_num(item.get("Weight (kg)"), 2),
-        "RMB /kg": fmt_num(item.get("RMB /kg"), 2),
-        "RMB /parcel": fmt_num(item.get("RMB /parcel"), 2),
+        "Weight (kg)": fmt_num(item.get("Weight (kg)")),
+        "RMB /kg": fmt_num(item.get("RMB /kg")),
+        "RMB /parcel": fmt_num(item.get("RMB /parcel")),
         "Pick&Packing/parcel": norm(route.get("Pick&Packing/parcel")),
         "RMB in total": None,
         "USD in total": None,
