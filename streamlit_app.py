@@ -93,7 +93,18 @@ def parse_json_response(text: str) -> Dict[str, Any]:
     raw = norm(text)
     raw = re.sub(r"^```json\s*", "", raw, flags=re.I)
     raw = re.sub(r"\s*```$", "", raw)
-    return json.loads(raw)
+
+    data = json.loads(raw)
+
+    if isinstance(data, dict):
+        return data
+
+    if isinstance(data, list):
+        return {"routes": data}
+
+    raise RuntimeError(
+        f"AI返回JSON类型错误：{type(data).__name__}"
+    )
 
 
 st.markdown(
